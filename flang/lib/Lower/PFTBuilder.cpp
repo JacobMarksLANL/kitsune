@@ -1,4 +1,4 @@
-//===-- PFTBuilder.cc -----------------------------------------------------===//
+//===-- PFTBuilder.cpp ----------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -29,6 +29,13 @@ static llvm::cl::opt<bool> nonRecursiveProcedures(
     llvm::cl::desc("Make procedures non-recursive by default. This was the "
                    "default for all Fortran standards prior to 2018."),
     llvm::cl::init(/*2018 standard=*/false));
+
+static llvm::cl::opt<bool> mainProgramGlobals(
+    "main-program-globals",
+    llvm::cl::desc(
+        "Allocate all variables in the main program as global variables and "
+        "not on the stack regardless of type, kind, and rank."),
+    llvm::cl::init(/*2018 standard=*/false), llvm::cl::Hidden);
 
 using namespace Fortran;
 
@@ -1265,7 +1272,7 @@ bool Fortran::lower::definedInCommonBlock(const semantics::Symbol &sym) {
   return semantics::FindCommonBlockContaining(sym);
 }
 
-static bool isReEntrant(const Fortran::semantics::Scope &scope) {
+static bool isReentrant(const Fortran::semantics::Scope &scope) {
   if (scope.kind() == Fortran::semantics::Scope::Kind::MainProgram)
     return false;
   if (scope.kind() == Fortran::semantics::Scope::Kind::Subprogram) {
@@ -1285,7 +1292,7 @@ bool Fortran::lower::symbolIsGlobal(const semantics::Symbol &sym) {
   if (const auto *details = sym.detailsIf<semantics::ObjectEntityDetails>()) {
     if (details->init())
       return true;
-    if (!isReEntrant(sym.owner())) {
+    if (!isReentrant(sym.owner())) {
       // Turn array and character of non re-entrant programs (like the main
       // program) into global memory.
       if (const Fortran::semantics::DeclTypeSpec *symTy = sym.GetType())
@@ -1295,6 +1302,9 @@ bool Fortran::lower::symbolIsGlobal(const semantics::Symbol &sym) {
       if (!details->shape().empty() || !details->coshape().empty())
         return true;
     }
+    if (mainProgramGlobals &&
+        sym.owner().kind() == Fortran::semantics::Scope::Kind::MainProgram)
+      return true;
   }
   return semantics::IsSaved(sym) || lower::definedInCommonBlock(sym) ||
          semantics::IsNamedConstant(sym);

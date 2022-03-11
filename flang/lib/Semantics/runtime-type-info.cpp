@@ -74,8 +74,8 @@ private:
       const Symbol &specificOrBinding, bool isAssignment, bool isFinal,
       std::optional<GenericKind::DefinedIo>);
   void IncorporateDefinedIoGenericInterfaces(
-      std::map<int, evaluate::StructureConstructor> &, SourceName,
-      GenericKind::DefinedIo, const Scope *);
+      std::map<int, evaluate::StructureConstructor> &, GenericKind::DefinedIo,
+      const Scope *);
 
   // Instantiated for ParamValue and Bound
   template <typename A>
@@ -243,6 +243,17 @@ static int GetIntegerKind(const Symbol &symbol) {
   return dyType->kind();
 }
 
+static void SetReadOnlyCompilerCreatedFlags(Symbol &symbol) {
+  symbol.set(Symbol::Flag::CompilerCreated);
+  // Runtime type info symbols may have types that are incompatible with the
+  // PARAMETER attribute (the main issue is that they may be TARGET, and normal
+  // Fortran parameters cannot be TARGETs).
+  if (symbol.has<semantics::ObjectEntityDetails>() ||
+      symbol.has<semantics::ProcEntityDetails>()) {
+    symbol.set(Symbol::Flag::ReadOnly);
+  }
+}
+
 // Save a rank-1 array constant of some numeric type as an
 // initialized data object in a scope.
 template <typename T>
@@ -268,7 +279,7 @@ static SomeExpr SaveNumericPointerTarget(
                         .try_emplace(name, Attrs{Attr::TARGET, Attr::SAVE},
                             std::move(object))
                         .first->second};
-    symbol.set(Symbol::Flag::CompilerCreated);
+    SetReadOnlyCompilerCreatedFlags(symbol);
     return evaluate::AsGenericExpr(
         evaluate::Expr<T>{evaluate::Designator<T>{symbol}});
   }
@@ -305,7 +316,7 @@ static SomeExpr SaveDerivedPointerTarget(Scope &scope, SourceName name,
                         .try_emplace(name, Attrs{Attr::TARGET, Attr::SAVE},
                             std::move(object))
                         .first->second};
-    symbol.set(Symbol::Flag::CompilerCreated);
+    SetReadOnlyCompilerCreatedFlags(symbol);
     return evaluate::AsGenericExpr(
         evaluate::Designator<evaluate::SomeDerived>{symbol});
   }
@@ -318,7 +329,7 @@ static SomeExpr SaveObjectInit(
                           ObjectEntityDetails{object})
                       .first->second};
   CHECK(symbol.get<ObjectEntityDetails>().init().has_value());
-  symbol.set(Symbol::Flag::CompilerCreated);
+  SetReadOnlyCompilerCreatedFlags(symbol);
   return evaluate::AsGenericExpr(
       evaluate::Designator<evaluate::SomeDerived>{symbol});
 }
@@ -512,18 +523,14 @@ const Symbol *RuntimeTableBuilder::DescribeType(Scope &dtScope) {
       DescribeSpecialProc(
           specials, *pair.second, false /*!isAssignment*/, true, std::nullopt);
     }
-    IncorporateDefinedIoGenericInterfaces(specials,
-        SourceName{"read(formatted)", 15},
-        GenericKind::DefinedIo::ReadFormatted, &scope);
-    IncorporateDefinedIoGenericInterfaces(specials,
-        SourceName{"read(unformatted)", 17},
-        GenericKind::DefinedIo::ReadUnformatted, &scope);
-    IncorporateDefinedIoGenericInterfaces(specials,
-        SourceName{"write(formatted)", 16},
-        GenericKind::DefinedIo::WriteFormatted, &scope);
-    IncorporateDefinedIoGenericInterfaces(specials,
-        SourceName{"write(unformatted)", 18},
-        GenericKind::DefinedIo::WriteUnformatted, &scope);
+    IncorporateDefinedIoGenericInterfaces(
+        specials, GenericKind::DefinedIo::ReadFormatted, &scope);
+    IncorporateDefinedIoGenericInterfaces(
+        specials, GenericKind::DefinedIo::ReadUnformatted, &scope);
+    IncorporateDefinedIoGenericInterfaces(
+        specials, GenericKind::DefinedIo::WriteFormatted, &scope);
+    IncorporateDefinedIoGenericInterfaces(
+        specials, GenericKind::DefinedIo::WriteUnformatted, &scope);
     // Pack the special procedure bindings in ascending order of their "which"
     // code values, and compile a little-endian bit-set of those codes for
     // use in O(1) look-up at run time.
@@ -617,7 +624,7 @@ Symbol &RuntimeTableBuilder::CreateObject(
       Attrs{Attr::TARGET, Attr::SAVE}, std::move(object))};
   CHECK(pair.second);
   Symbol &result{*pair.first->second};
-  result.set(Symbol::Flag::CompilerCreated);
+  SetReadOnlyCompilerCreatedFlags(result);
   return result;
 }
 
@@ -645,7 +652,7 @@ SomeExpr RuntimeTableBuilder::SaveNameAsPointerTarget(
                       .try_emplace(SaveObjectName(".n."s + name),
                           Attrs{Attr::TARGET, Attr::SAVE}, std::move(object))
                       .first->second};
-  symbol.set(Symbol::Flag::CompilerCreated);
+  SetReadOnlyCompilerCreatedFlags(symbol);
   return evaluate::AsGenericExpr(
       AsciiExpr{evaluate::Designator<Ascii>{symbol}});
 }
@@ -830,7 +837,7 @@ bool RuntimeTableBuilder::InitializeDataPointer(
         ".dp."s + distinctName + "."s + symbol.name().ToString())};
     Symbol &ptrDtSym{
         *scope.try_emplace(ptrDtName, Attrs{}, UnknownDetails{}).first->second};
-    ptrDtSym.set(Symbol::Flag::CompilerCreated);
+    SetReadOnlyCompilerCreatedFlags(ptrDtSym);
     Scope &ptrDtScope{scope.MakeScope(Scope::Kind::DerivedType, &ptrDtSym)};
     ignoreScopes_.insert(&ptrDtScope);
     ObjectEntityDetails ptrDtObj;
@@ -1061,8 +1068,9 @@ void RuntimeTableBuilder::DescribeSpecialProc(
 }
 
 void RuntimeTableBuilder::IncorporateDefinedIoGenericInterfaces(
-    std::map<int, evaluate::StructureConstructor> &specials, SourceName name,
+    std::map<int, evaluate::StructureConstructor> &specials,
     GenericKind::DefinedIo definedIo, const Scope *scope) {
+  SourceName name{GenericKind::AsFortran(definedIo)};
   for (; !scope->IsGlobal(); scope = &scope->parent()) {
     if (auto asst{scope->find(name)}; asst != scope->end()) {
       const Symbol &generic{asst->second->GetUltimate()};
@@ -1081,7 +1089,7 @@ void RuntimeTableBuilder::IncorporateDefinedIoGenericInterfaces(
 RuntimeDerivedTypeTables BuildRuntimeDerivedTypeTables(
     SemanticsContext &context) {
   RuntimeDerivedTypeTables result;
-  result.schemata = context.GetBuiltinModule("__fortran_type_info");
+  result.schemata = context.GetBuiltinModule(typeInfoBuiltinModule);
   if (result.schemata) {
     RuntimeTableBuilder builder{context, result};
     builder.DescribeTypes(context.globalScope(), false);

@@ -8,6 +8,7 @@
 
 #include "flang/Frontend/CompilerInvocation.h"
 #include "flang/Common/Fortran-features.h"
+#include "flang/Frontend/FrontendActions.h"
 #include "flang/Frontend/PreprocessorOptions.h"
 #include "flang/Semantics/semantics.h"
 #include "flang/Version.inc"
@@ -132,6 +133,9 @@ static bool ParseFrontendArgs(FrontendOptions &opts, llvm::opt::ArgList &args,
       break;
     case clang::driver::options::OPT_emit_llvm:
       opts.programAction = EmitLLVM;
+      break;
+    case clang::driver::options::OPT_emit_llvm_bc:
+      opts.programAction = EmitLLVMBitcode;
       break;
     case clang::driver::options::OPT_emit_obj:
       opts.programAction = EmitObj;
@@ -662,8 +666,8 @@ void CompilerInvocation::setFortranOpts() {
       preprocessorOptions.searchDirectoriesFromIntrModPath.begin(),
       preprocessorOptions.searchDirectoriesFromIntrModPath.end());
 
-  //  Add the default intrinsic module directory at the end
-  fortranOptions.searchDirectories.emplace_back(getIntrinsicDir());
+  //  Add the default intrinsic module directory
+  fortranOptions.intrinsicModuleDirectories.emplace_back(getIntrinsicDir());
 
   // Add the directory supplied through -J/-module-dir to the list of search
   // directories
@@ -690,6 +694,7 @@ void CompilerInvocation::setSemanticsOpts(
 
   semanticsContext_->set_moduleDirectory(moduleDir())
       .set_searchDirectories(fortranOptions.searchDirectories)
+      .set_intrinsicModuleDirectories(fortranOptions.intrinsicModuleDirectories)
       .set_warnOnNonstandardUsage(enableConformanceChecks())
       .set_warningsAreErrors(warnAsErr())
       .set_moduleFileSuffix(moduleFileSuffix());

@@ -36,10 +36,13 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Bitcode/BitcodeWriterPass.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <clang/Basic/Diagnostic.h>
@@ -57,16 +60,37 @@ bool PrescanAndParseAction::BeginSourceFileAction() {
 }
 
 bool PrescanAndSemaAction::BeginSourceFileAction() {
-  return RunPrescan() && RunParse() && RunSemanticChecks();
+  return RunPrescan() && RunParse() && RunSemanticChecks() &&
+      GenerateRtTypeTables();
 }
 
 bool PrescanAndSemaDebugAction::BeginSourceFileAction() {
-  // Semantic checks are made to succeed unconditionally.
-  return RunPrescan() && RunParse() && (RunSemanticChecks() || true);
+  // This is a "debug" action for development purposes. To facilitate this, the
+  // semantic checks are made to succeed unconditionally to prevent this action
+  // from exiting early (i.e. in the presence of semantic errors). We should
+  // never do this in actions intended for end-users or otherwise regular
+  // compiler workflows!
+  if (RunPrescan() && RunParse()) {
+    (void)RunSemanticChecks();
+    (void)GenerateRtTypeTables();
+    return true;
+  }
+
+  return false;
 }
 
 bool CodeGenAction::BeginSourceFileAction() {
-  bool res = RunPrescan() && RunParse() && RunSemanticChecks();
+  llvmCtx_ = std::make_unique<llvm::LLVMContext>();
+  if (this->currentInput().kind().GetLanguage() == Language::LLVM_IR) {
+    // Parse the bitcode...
+    SMDiagnostic err;
+    llvmModule_ = parseIRFile(currentInput().file(), err, *llvmCtx_);
+
+    return (nullptr != llvmModule_);
+  }
+
+  bool res = RunPrescan() && RunParse() && RunSemanticChecks() &&
+      GenerateRtTypeTables();
   if (!res)
     return res;
 
@@ -181,8 +205,7 @@ void DebugDumpProvenanceAction::ExecuteAction() {
   this->instance().parsing().DumpProvenance(llvm::outs());
 }
 
-void ParseSyntaxOnlyAction::ExecuteAction() {
-}
+void ParseSyntaxOnlyAction::ExecuteAction() {}
 
 void DebugUnparseNoSemaAction::ExecuteAction() {
   auto &invoc = this->instance().invocation();
@@ -227,25 +250,18 @@ void DebugUnparseWithSymbolsAction::ExecuteAction() {
 
 void DebugDumpSymbolsAction::ExecuteAction() {
   CompilerInstance &ci = this->instance();
-  auto &semantics = ci.semantics();
 
-  auto tables{Fortran::semantics::BuildRuntimeDerivedTypeTables(
-      instance().invocation().semanticsContext())};
-  // The runtime derived type information table builder may find and report
-  // semantic errors. So it is important that we report them _after_
-  // BuildRuntimeDerivedTypeTables is run.
-  reportFatalSemanticErrors();
-
-  if (!tables.schemata) {
+  if (!ci.getRtTyTables().schemata) {
     unsigned DiagID =
         ci.diagnostics().getCustomDiagID(clang::DiagnosticsEngine::Error,
             "could not find module file for __fortran_type_info");
     ci.diagnostics().Report(DiagID);
     llvm::errs() << "\n";
+    return;
   }
 
   // Dump symbols
-  semantics.DumpSymbols(llvm::outs());
+  ci.semantics().DumpSymbols(llvm::outs());
 }
 
 void DebugDumpAllAction::ExecuteAction() {
@@ -259,27 +275,20 @@ void DebugDumpAllAction::ExecuteAction() {
   Fortran::parser::DumpTree(
       llvm::outs(), parseTree, &ci.invocation().asFortran());
 
-  auto &semantics = ci.semantics();
-  auto tables{Fortran::semantics::BuildRuntimeDerivedTypeTables(
-      instance().invocation().semanticsContext())};
-  // The runtime derived type information table builder may find and report
-  // semantic errors. So it is important that we report them _after_
-  // BuildRuntimeDerivedTypeTables is run.
-  reportFatalSemanticErrors();
-
-  if (!tables.schemata) {
+  if (!ci.getRtTyTables().schemata) {
     unsigned DiagID =
         ci.diagnostics().getCustomDiagID(clang::DiagnosticsEngine::Error,
             "could not find module file for __fortran_type_info");
     ci.diagnostics().Report(DiagID);
     llvm::errs() << "\n";
+    return;
   }
 
   // Dump symbols
   llvm::outs() << "=====================";
   llvm::outs() << " Flang: symbols dump ";
   llvm::outs() << "=====================\n";
-  semantics.DumpSymbols(llvm::outs());
+  ci.semantics().DumpSymbols(llvm::outs());
 }
 
 void DebugDumpParseTreeNoSemaAction::ExecuteAction() {
@@ -476,7 +485,6 @@ void CodeGenAction::GenerateLLVMIR() {
 
   // Translate to LLVM IR
   auto optName = mlirMod.getName();
-  llvmCtx_ = std::make_unique<llvm::LLVMContext>();
   llvmModule_ = mlir::translateModuleToLLVMIR(
       mlirMod, *llvmCtx_, optName ? *optName : "FIRModule");
 
@@ -490,13 +498,15 @@ void CodeGenAction::GenerateLLVMIR() {
 
 void EmitLLVMAction::ExecuteAction() {
   CompilerInstance &ci = this->instance();
-  GenerateLLVMIR();
+  // Generate an LLVM module if it's not already present (it will already be
+  // present if the input file is an LLVM IR/BC file).
+  if (!llvmModule_)
+    GenerateLLVMIR();
 
   // Print the generated LLVM IR. If there is no pre-defined output stream to
   // print to, create an output file.
   std::unique_ptr<llvm::raw_ostream> os;
   if (ci.IsOutputStreamNull()) {
-    // Lower from the LLVM dialect to LLVM IR
     os = ci.CreateDefaultOutputFile(
         /*Binary=*/true, /*InFile=*/GetCurrentFileOrBufferName(), "ll");
     if (!os) {
@@ -513,13 +523,56 @@ void EmitLLVMAction::ExecuteAction() {
   } else {
     llvmModule_->print(*os, /*AssemblyAnnotationWriter=*/nullptr);
   }
+}
 
-  return;
+void EmitLLVMBitcodeAction::ExecuteAction() {
+  CompilerInstance &ci = this->instance();
+  // Generate an LLVM module if it's not already present (it will already be
+  // present if the input file is an LLVM IR/BC file).
+  if (!llvmModule_)
+    GenerateLLVMIR();
+
+  ModulePassManager MPM;
+  ModuleAnalysisManager MAM;
+
+  // Create `Target`
+  std::string error;
+  std::string theTriple = llvmModule_->getTargetTriple();
+  const llvm::Target *theTarget =
+      TargetRegistry::lookupTarget(theTriple, error);
+  assert(theTarget && "Failed to create Target");
+
+  // Create `TargetMachine`
+  std::unique_ptr<TargetMachine> TM;
+
+  TM.reset(theTarget->createTargetMachine(
+      theTriple, /*CPU=*/"", /*Features=*/"", llvm::TargetOptions(), None));
+  llvmModule_->setDataLayout(TM->createDataLayout());
+  assert(TM && "Failed to create TargetMachine");
+
+  PassBuilder PB(TM.get());
+  PB.registerModuleAnalyses(MAM);
+
+  // Generate an output file
+  std::unique_ptr<llvm::raw_ostream> os = ci.CreateDefaultOutputFile(
+      /*Binary=*/true, /*InFile=*/GetCurrentFileOrBufferName(), "bc");
+  if (!os) {
+    unsigned diagID = ci.diagnostics().getCustomDiagID(
+        clang::DiagnosticsEngine::Error, "failed to create the output file");
+    ci.diagnostics().Report(diagID);
+    return;
+  }
+
+  MPM.addPass(BitcodeWriterPass(*os));
+  MPM.run(*llvmModule_, MAM);
 }
 
 void BackendAction::ExecuteAction() {
   CompilerInstance &ci = this->instance();
-  GenerateLLVMIR();
+  // Generate an LLVM module if it's not already present (it will already be
+  // present if the input file is an LLVM IR/BC file).
+  if (!llvmModule_)
+    GenerateLLVMIR();
 
   // Create `Target`
   std::string error;
@@ -582,13 +635,17 @@ void BackendAction::ExecuteAction() {
       ? llvm::CodeGenFileType::CGFT_AssemblyFile
       : llvm::CodeGenFileType::CGFT_ObjectFile;
   if (TM->addPassesToEmitFile(CodeGenPasses,
-          ci.IsOutputStreamNull() ? *os : ci.GetOutputStream(), nullptr, cgft))
-    assert(false && "Something went wrong");
+          ci.IsOutputStreamNull() ? *os : ci.GetOutputStream(), nullptr,
+          cgft)) {
+    unsigned diagID =
+        ci.diagnostics().getCustomDiagID(clang::DiagnosticsEngine::Error,
+            "emission of this file type is not supported");
+    ci.diagnostics().Report(diagID);
+    return;
+  }
 
   // Run the code-gen passes
   CodeGenPasses.run(*llvmModule_);
-
-  return;
 }
 
 void InitOnlyAction::ExecuteAction() {

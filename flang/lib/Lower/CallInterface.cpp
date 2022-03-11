@@ -38,14 +38,18 @@ mlir::Type getProcedureDesignatorType(
     const Fortran::evaluate::characteristics::Procedure *,
     Fortran::lower::AbstractConverter &converter) {
   // TODO: Get actual function type of the dummy procedure, at least when an
-  // interface is given.
+  // interface is given. The result type should be available even if the arity
+  // and type of the arguments is not.
+  llvm::SmallVector<mlir::Type> resultTys;
+  llvm::SmallVector<mlir::Type> inputTys;
   // In general, that is a nice to have but we cannot guarantee to find the
   // function type that will match the one of the calls, we may not even know
   // how many arguments the dummy procedure accepts (e.g. if a procedure
   // pointer is only transiting through the current procedure without being
   // called), so a function type cast must always be inserted.
-  return mlir::FunctionType::get(&converter.getMLIRContext(), llvm::None,
-                                 llvm::None);
+  auto *context = &converter.getMLIRContext();
+  auto untypedFunc = mlir::FunctionType::get(context, inputTys, resultTys);
+  return fir::BoxProcType::get(context, untypedFunc);
 }
 
 //===----------------------------------------------------------------------===//
@@ -235,11 +239,10 @@ void Fortran::lower::CallerInterface::walkResultExtents(
     ExprVisitor visitor) const {
   // Walk directly the result symbol shape (the characteristic shape may contain
   // descriptor inquiries to it that would fail to lower on the caller side).
-  const Fortran::semantics::Symbol *interfaceSymbol =
-      procRef.proc().GetInterfaceSymbol();
-  if (interfaceSymbol) {
-    const Fortran::semantics::Symbol &result =
-        interfaceSymbol->get<Fortran::semantics::SubprogramDetails>().result();
+  const Fortran::semantics::SubprogramDetails *interfaceDetails =
+      getInterfaceDetails();
+  if (interfaceDetails) {
+    const Fortran::semantics::Symbol &result = interfaceDetails->result();
     if (const auto *objectDetails =
             result.detailsIf<Fortran::semantics::ObjectEntityDetails>())
       if (objectDetails->shape().IsExplicitShape())
@@ -259,7 +262,7 @@ bool Fortran::lower::CallerInterface::mustMapInterfaceSymbols() const {
   const std::optional<Fortran::evaluate::characteristics::FunctionResult>
       &result = characteristic->functionResult;
   if (!result || result->CanBeReturnedViaImplicitInterface() ||
-      !procRef.proc().GetInterfaceSymbol())
+      !getInterfaceDetails())
     return false;
   bool allResultSpecExprConstant = true;
   auto visitor = [&](const Fortran::lower::SomeExpr &e) {
@@ -273,12 +276,13 @@ bool Fortran::lower::CallerInterface::mustMapInterfaceSymbols() const {
 mlir::Value Fortran::lower::CallerInterface::getArgumentValue(
     const semantics::Symbol &sym) const {
   mlir::Location loc = converter.getCurrentLocation();
-  const Fortran::semantics::Symbol *iface = procRef.proc().GetInterfaceSymbol();
-  if (!iface)
+  const Fortran::semantics::SubprogramDetails *ifaceDetails =
+      getInterfaceDetails();
+  if (!ifaceDetails)
     fir::emitFatalError(
         loc, "mapping actual and dummy arguments requires an interface");
   const std::vector<Fortran::semantics::Symbol *> &dummies =
-      iface->get<semantics::SubprogramDetails>().dummyArgs();
+      ifaceDetails->dummyArgs();
   auto it = std::find(dummies.begin(), dummies.end(), &sym);
   if (it == dummies.end())
     fir::emitFatalError(loc, "symbol is not a dummy in this call");
@@ -296,11 +300,21 @@ mlir::Type Fortran::lower::CallerInterface::getResultStorageType() const {
 const Fortran::semantics::Symbol &
 Fortran::lower::CallerInterface::getResultSymbol() const {
   mlir::Location loc = converter.getCurrentLocation();
-  const Fortran::semantics::Symbol *iface = procRef.proc().GetInterfaceSymbol();
-  if (!iface)
+  const Fortran::semantics::SubprogramDetails *ifaceDetails =
+      getInterfaceDetails();
+  if (!ifaceDetails)
     fir::emitFatalError(
         loc, "mapping actual and dummy arguments requires an interface");
-  return iface->get<semantics::SubprogramDetails>().result();
+  return ifaceDetails->result();
+}
+
+const Fortran::semantics::SubprogramDetails *
+Fortran::lower::CallerInterface::getInterfaceDetails() const {
+  if (const Fortran::semantics::Symbol *iface =
+          procRef.proc().GetInterfaceSymbol())
+    return iface->GetUltimate()
+        .detailsIf<Fortran::semantics::SubprogramDetails>();
+  return nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -563,6 +577,7 @@ public:
       addFirResult(mlir::IndexType::get(&mlirContext),
                    FirPlaceHolder::resultEntityPosition, Property::Value);
     }
+    bool isBindC = procedure.IsBindC();
     // Handle arguments
     const auto &argumentEntities =
         getEntityContainer(interface.side().getCallDescription());
@@ -577,7 +592,8 @@ public:
                 if (dummy.CanBePassedViaImplicitInterface())
                   handleImplicitDummy(&argCharacteristics, dummy, entity);
                 else
-                  handleExplicitDummy(&argCharacteristics, dummy, entity);
+                  handleExplicitDummy(&argCharacteristics, dummy, entity,
+                                      isBindC);
               },
               [&](const Fortran::evaluate::characteristics::DummyProcedure
                       &dummy) {
@@ -774,7 +790,7 @@ private:
   void handleExplicitDummy(
       const DummyCharacteristics *characteristics,
       const Fortran::evaluate::characteristics::DummyDataObject &obj,
-      const FortranEntity &entity) {
+      const FortranEntity &entity, bool isBindC) {
     using Attrs = Fortran::evaluate::characteristics::DummyDataObject::Attr;
 
     bool isValueAttr = false;
@@ -830,6 +846,8 @@ private:
       addPassedArg(PassEntityBy::MutableBox, entity, characteristics);
     } else if (dummyRequiresBox(obj)) {
       // Pass as fir.box
+      if (isValueAttr)
+        TODO(loc, "assumed shape dummy argument with VALUE attribute");
       addFirOperand(boxType, nextPassedArgPosition(), Property::Box, attrs);
       addPassedArg(PassEntityBy::Box, entity, characteristics);
     } else if (dynamicType.category() ==
@@ -843,13 +861,21 @@ private:
                                : PassEntityBy::BoxChar,
                    entity, characteristics);
     } else {
-      // Pass as fir.ref
-      mlir::Type refType = fir::ReferenceType::get(type);
-      addFirOperand(refType, nextPassedArgPosition(), Property::BaseAddress,
-                    attrs);
-      addPassedArg(isValueAttr ? PassEntityBy::BaseAddressValueAttribute
-                               : PassEntityBy::BaseAddress,
-                   entity, characteristics);
+      // Pass as fir.ref unless it's by VALUE and BIND(C)
+      mlir::Type passType = fir::ReferenceType::get(type);
+      PassEntityBy passBy = PassEntityBy::BaseAddress;
+      Property prop = Property::BaseAddress;
+      if (isValueAttr) {
+        if (isBindC) {
+          passBy = PassEntityBy::Value;
+          prop = Property::Value;
+          passType = type;
+        } else {
+          passBy = PassEntityBy::BaseAddressValueAttribute;
+        }
+      }
+      addFirOperand(passType, nextPassedArgPosition(), prop, attrs);
+      addPassedArg(passBy, entity, characteristics);
     }
   }
 

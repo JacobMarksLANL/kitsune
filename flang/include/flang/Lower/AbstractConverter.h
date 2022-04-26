@@ -155,7 +155,7 @@ public:
   virtual mlir::Type genType(SymbolRef) = 0;
   /// Generate the type from a category
   virtual mlir::Type genType(Fortran::common::TypeCategory tc) = 0;
-  /// Generate the type from a category and kind and length parameters.
+  /// Generate the type from a category and kind and LEN parameters.
   virtual mlir::Type
   genType(Fortran::common::TypeCategory tc, int kind,
           llvm::ArrayRef<std::int64_t> lenParameters = llvm::None) = 0;
@@ -163,6 +163,11 @@ public:
   virtual mlir::Type genType(const Fortran::semantics::DerivedTypeSpec &) = 0;
   /// Generate the type from a Variable
   virtual mlir::Type genType(const pft::Variable &) = 0;
+
+  /// Register a runtime derived type information object symbol to ensure its
+  /// object will be generated as a global.
+  virtual void registerRuntimeTypeInfo(mlir::Location loc,
+                                       SymbolRef typeInfoSym) = 0;
 
   //===--------------------------------------------------------------------===//
   // Locations

@@ -949,7 +949,8 @@ static const SpecificIntrinsicInterface specificIntrinsicFunction[]{
              {"y", AnyIntOrReal, Rank::elementalOrBOZ, Optionality::optional}},
          DoublePrecisionComplex},
         "cmplx", true},
-    {{"dconjg", {{"z", AnyComplex}}, DoublePrecisionComplex}, "conjg"},
+    {{"dconjg", {{"z", DoublePrecisionComplex}}, DoublePrecisionComplex},
+        "conjg"},
     {{"dcos", {{"x", DoublePrecision}}, DoublePrecision}, "cos"},
     {{"dcosh", {{"x", DoublePrecision}}, DoublePrecision}, "cosh"},
     {{"ddim", {{"x", DoublePrecision}, {"y", DoublePrecision}},
@@ -958,7 +959,7 @@ static const SpecificIntrinsicInterface specificIntrinsicFunction[]{
     {{"dexp", {{"x", DoublePrecision}}, DoublePrecision}, "exp"},
     {{"dfloat", {{"a", AnyInt}}, DoublePrecision}, "real", true},
     {{"dim", {{"x", DefaultReal}, {"y", DefaultReal}}, DefaultReal}},
-    {{"dimag", {{"z", AnyComplex}}, DoublePrecision}, "aimag"},
+    {{"dimag", {{"z", DoublePrecisionComplex}}, DoublePrecision}, "aimag"},
     {{"dint", {{"a", DoublePrecision}}, DoublePrecision}, "aint"},
     {{"dlog", {{"x", DoublePrecision}}, DoublePrecision}, "log"},
     {{"dlog10", {{"x", DoublePrecision}}, DoublePrecision}, "log10"},
@@ -1506,7 +1507,7 @@ std::optional<SpecificCall> IntrinsicInterface::Match(
           if (auto shape{GetShape(context, *arg)}) {
             if (auto constShape{AsConstantShape(context, *shape)}) {
               shapeArgSize = constShape->At(ConstantSubscripts{1}).ToInt64();
-              CHECK(shapeArgSize >= 0);
+              CHECK(*shapeArgSize >= 0);
               argOk = true;
             }
           }
@@ -2307,9 +2308,7 @@ static bool ApplySpecificChecks(SpecificCall &call, FoldingContext &context) {
     const auto &arg{call.arguments[0]};
     if (arg) {
       if (const auto *expr{arg->UnwrapExpr()}) {
-        if (const Symbol * symbol{GetLastSymbol(*expr)}) {
-          ok = symbol->attrs().test(semantics::Attr::ALLOCATABLE);
-        }
+        ok = evaluate::IsAllocatableDesignator(*expr);
       }
     }
     if (!ok) {
@@ -2399,7 +2398,7 @@ std::optional<SpecificCall> IntrinsicProcTable::Implementation::Probe(
           "Cannot use intrinsic function '%s' as a subroutine"_err_en_US,
           call.name);
     }
-    return std::nullopt; // TODO
+    return std::nullopt;
   }
 
   // Helper to avoid emitting errors before it is sure there is no match

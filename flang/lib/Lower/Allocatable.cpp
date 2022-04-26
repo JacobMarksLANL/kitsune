@@ -303,7 +303,6 @@ private:
   void lowerAllocation(const Allocation &alloc) {
     fir::MutableBoxValue boxAddr =
         genMutableBoxValue(converter, loc, alloc.getAllocObj());
-    mlir::Value backupBox;
 
     if (sourceExpr) {
       genSourceAllocation(alloc, boxAddr);
@@ -430,7 +429,7 @@ private:
     if (const Fortran::semantics::DerivedTypeSpec *derived =
             typeSpec->AsDerived())
       if (Fortran::semantics::CountLenParameters(*derived) > 0)
-        TODO(loc, "TODO: setting derived type params in allocation");
+        TODO(loc, "setting derived type params in allocation");
     if (typeSpec->category() ==
         Fortran::semantics::DeclTypeSpec::Category::Character) {
       Fortran::semantics::ParamValue lenParam =
@@ -468,7 +467,7 @@ private:
     TODO(loc, "MOLD allocation lowering");
   }
   void genSetType(const Allocation &, const fir::MutableBoxValue &) {
-    TODO(loc, "Polymorphic entity allocation lowering");
+    TODO(loc, "polymorphic entity allocation lowering");
   }
 
   /// Returns a pointer to the DeclTypeSpec if a type-spec is provided in the

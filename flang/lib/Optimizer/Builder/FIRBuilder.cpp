@@ -333,6 +333,14 @@ mlir::Value fir::FirOpBuilder::createConvert(mlir::Location loc,
   return val;
 }
 
+void fir::FirOpBuilder::createStoreWithConvert(mlir::Location loc,
+                                               mlir::Value val,
+                                               mlir::Value addr) {
+  mlir::Value cast =
+      createConvert(loc, fir::unwrapRefType(addr.getType()), val);
+  create<fir::StoreOp>(loc, cast, addr);
+}
+
 fir::StringLitOp fir::FirOpBuilder::createStringLitOp(mlir::Location loc,
                                                       llvm::StringRef data) {
   auto type = fir::CharacterType::get(getContext(), 1, data.size());
@@ -499,13 +507,14 @@ genNullPointerComparison(fir::FirOpBuilder &builder, mlir::Location loc,
   return builder.create<mlir::arith::CmpIOp>(loc, condition, ptrToInt, c0);
 }
 
-mlir::Value fir::FirOpBuilder::genIsNotNull(mlir::Location loc,
-                                            mlir::Value addr) {
+mlir::Value fir::FirOpBuilder::genIsNotNullAddr(mlir::Location loc,
+                                                mlir::Value addr) {
   return genNullPointerComparison(*this, loc, addr,
                                   mlir::arith::CmpIPredicate::ne);
 }
 
-mlir::Value fir::FirOpBuilder::genIsNull(mlir::Location loc, mlir::Value addr) {
+mlir::Value fir::FirOpBuilder::genIsNullAddr(mlir::Location loc,
+                                             mlir::Value addr) {
   return genNullPointerComparison(*this, loc, addr,
                                   mlir::arith::CmpIPredicate::eq);
 }
@@ -638,7 +647,7 @@ fir::factory::readExtents(fir::FirOpBuilder &builder, mlir::Location loc,
 }
 
 llvm::SmallVector<mlir::Value>
-fir::factory::getExtents(fir::FirOpBuilder &builder, mlir::Location loc,
+fir::factory::getExtents(mlir::Location loc, fir::FirOpBuilder &builder,
                          const fir::ExtendedValue &box) {
   return box.match(
       [&](const fir::ArrayBoxValue &x) -> llvm::SmallVector<mlir::Value> {
@@ -652,7 +661,7 @@ fir::factory::getExtents(fir::FirOpBuilder &builder, mlir::Location loc,
       },
       [&](const fir::MutableBoxValue &x) -> llvm::SmallVector<mlir::Value> {
         auto load = fir::factory::genMutableBoxRead(builder, loc, x);
-        return fir::factory::getExtents(builder, loc, load);
+        return fir::factory::getExtents(loc, builder, load);
       },
       [&](const auto &) -> llvm::SmallVector<mlir::Value> { return {}; });
 }
@@ -672,7 +681,7 @@ fir::ExtendedValue fir::factory::readBoxValue(fir::FirOpBuilder &builder,
                                   fir::factory::readExtents(builder, loc, box),
                                   box.getLBounds());
   }
-  if (box.isDerivedWithLengthParameters())
+  if (box.isDerivedWithLenParameters())
     TODO(loc, "read fir.box with length parameters");
   if (box.rank() == 0)
     return addr;
@@ -703,7 +712,7 @@ fir::factory::getNonDefaultLowerBounds(fir::FirOpBuilder &builder,
 }
 
 llvm::SmallVector<mlir::Value>
-fir::factory::getNonDeferredLengthParams(const fir::ExtendedValue &exv) {
+fir::factory::getNonDeferredLenParams(const fir::ExtendedValue &exv) {
   return exv.match(
       [&](const fir::CharArrayBoxValue &character)
           -> llvm::SmallVector<mlir::Value> { return {character.getLen()}; },
@@ -718,6 +727,71 @@ fir::factory::getNonDeferredLengthParams(const fir::ExtendedValue &exv) {
                 box.getExplicitParameters().end()};
       },
       [&](const auto &) -> llvm::SmallVector<mlir::Value> { return {}; });
+}
+
+// If valTy is a box type, then we need to extract the type parameters from
+// the box value.
+static llvm::SmallVector<mlir::Value> getFromBox(mlir::Location loc,
+                                                 fir::FirOpBuilder &builder,
+                                                 mlir::Type valTy,
+                                                 mlir::Value boxVal) {
+  if (auto boxTy = valTy.dyn_cast<fir::BoxType>()) {
+    auto eleTy = fir::unwrapAllRefAndSeqType(boxTy.getEleTy());
+    if (auto recTy = eleTy.dyn_cast<fir::RecordType>()) {
+      if (recTy.getNumLenParams() > 0) {
+        // Walk each type parameter in the record and get the value.
+        TODO(loc, "generate code to get LEN type parameters");
+      }
+    } else if (auto charTy = eleTy.dyn_cast<fir::CharacterType>()) {
+      if (charTy.hasDynamicLen()) {
+        auto idxTy = builder.getIndexType();
+        auto eleSz = builder.create<fir::BoxEleSizeOp>(loc, idxTy, boxVal);
+        auto kindBytes =
+            builder.getKindMap().getCharacterBitsize(charTy.getFKind()) / 8;
+        mlir::Value charSz =
+            builder.createIntegerConstant(loc, idxTy, kindBytes);
+        mlir::Value len =
+            builder.create<mlir::arith::DivSIOp>(loc, eleSz, charSz);
+        return {len};
+      }
+    }
+  }
+  return {};
+}
+
+// fir::getTypeParams() will get the type parameters from the extended value.
+// When the extended value is a BoxValue or MutableBoxValue, it may be necessary
+// to generate code, so this factory function handles those cases.
+// TODO: fix the inverted type tests, etc.
+llvm::SmallVector<mlir::Value>
+fir::factory::getTypeParams(mlir::Location loc, fir::FirOpBuilder &builder,
+                            const fir::ExtendedValue &exv) {
+  auto handleBoxed = [&](const auto &box) -> llvm::SmallVector<mlir::Value> {
+    if (box.isCharacter())
+      return {fir::factory::readCharLen(builder, loc, exv)};
+    if (box.isDerivedWithLenParameters()) {
+      // This should generate code to read the type parameters from the box.
+      // This requires some consideration however as MutableBoxValues need to be
+      // in a sane state to be provide the correct values.
+      TODO(loc, "derived type with type parameters");
+    }
+    return {};
+  };
+  // Intentionally reuse the original code path to get type parameters for the
+  // cases that were supported rather than introduce a new path.
+  return exv.match(
+      [&](const fir::BoxValue &box) { return handleBoxed(box); },
+      [&](const fir::MutableBoxValue &box) { return handleBoxed(box); },
+      [&](const auto &) { return fir::getTypeParams(exv); });
+}
+
+llvm::SmallVector<mlir::Value>
+fir::factory::getTypeParams(mlir::Location loc, fir::FirOpBuilder &builder,
+                            fir::ArrayLoadOp load) {
+  mlir::Type memTy = load.getMemref().getType();
+  if (auto boxTy = memTy.dyn_cast<fir::BoxType>())
+    return getFromBox(loc, builder, boxTy, load.getMemref());
+  return load.getTypeparams();
 }
 
 std::string fir::factory::uniqueCGIdent(llvm::StringRef prefix,
@@ -875,7 +949,7 @@ fir::ExtendedValue fir::factory::arrayElementToExtendedValue(
           auto len = fir::factory::readCharLen(builder, loc, box);
           return fir::CharBoxValue{element, len};
         }
-        if (box.isDerivedWithLengthParameters())
+        if (box.isDerivedWithLenParameters())
           TODO(loc, "get length parameters from derived type BoxValue");
         return element;
       },
@@ -1131,4 +1205,25 @@ mlir::Value fir::factory::createZeroValue(fir::FirOpBuilder &builder,
   }
   fir::emitFatalError(loc, "internal: trying to generate zero value of non "
                            "numeric or logical type");
+}
+
+llvm::Optional<std::int64_t> fir::factory::getIntIfConstant(mlir::Value value) {
+  if (auto definingOp = value.getDefiningOp())
+    if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(definingOp))
+      if (auto intAttr = cst.value().dyn_cast<mlir::IntegerAttr>())
+        return intAttr.getInt();
+  return {};
+}
+
+mlir::Value fir::factory::genMaxWithZero(fir::FirOpBuilder &builder,
+                                         mlir::Location loc,
+                                         mlir::Value value) {
+  mlir::Value zero = builder.createIntegerConstant(loc, value.getType(), 0);
+  if (mlir::Operation *definingOp = value.getDefiningOp())
+    if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(definingOp))
+      if (auto intAttr = cst.value().dyn_cast<mlir::IntegerAttr>())
+        return intAttr.getInt() > 0 ? value : zero;
+  mlir::Value valueIsGreater = builder.create<mlir::arith::CmpIOp>(
+      loc, mlir::arith::CmpIPredicate::sgt, value, zero);
+  return builder.create<mlir::SelectOp>(loc, valueIsGreater, value, zero);
 }

@@ -99,23 +99,23 @@ TEST_F(FIRBuilderTest, genIfWithThenAndElse) {
 // Helper functions tests
 //===----------------------------------------------------------------------===//
 
-TEST_F(FIRBuilderTest, genIsNotNull) {
+TEST_F(FIRBuilderTest, genIsNotNullAddr) {
   auto builder = getBuilder();
   auto loc = builder.getUnknownLoc();
   auto dummyValue =
       builder.createIntegerConstant(loc, builder.getIndexType(), 0);
-  auto res = builder.genIsNotNull(loc, dummyValue);
+  auto res = builder.genIsNotNullAddr(loc, dummyValue);
   EXPECT_TRUE(mlir::isa<arith::CmpIOp>(res.getDefiningOp()));
   auto cmpOp = dyn_cast<arith::CmpIOp>(res.getDefiningOp());
   EXPECT_EQ(arith::CmpIPredicate::ne, cmpOp.getPredicate());
 }
 
-TEST_F(FIRBuilderTest, genIsNull) {
+TEST_F(FIRBuilderTest, genIsNullAddr) {
   auto builder = getBuilder();
   auto loc = builder.getUnknownLoc();
   auto dummyValue =
       builder.createIntegerConstant(loc, builder.getIndexType(), 0);
-  auto res = builder.genIsNull(loc, dummyValue);
+  auto res = builder.genIsNullAddr(loc, dummyValue);
   EXPECT_TRUE(mlir::isa<arith::CmpIOp>(res.getDefiningOp()));
   auto cmpOp = dyn_cast<arith::CmpIOp>(res.getDefiningOp());
   EXPECT_EQ(arith::CmpIPredicate::eq, cmpOp.getPredicate());
@@ -147,8 +147,7 @@ TEST_F(FIRBuilderTest, createRealZeroConstant) {
   EXPECT_TRUE(mlir::isa<mlir::arith::ConstantOp>(cst.getDefiningOp()));
   auto cstOp = dyn_cast<mlir::arith::ConstantOp>(cst.getDefiningOp());
   EXPECT_EQ(realTy, cstOp.getType());
-  EXPECT_EQ(
-      0u, cstOp.value().cast<FloatAttr>().getValue().convertToDouble());
+  EXPECT_EQ(0u, cstOp.value().cast<FloatAttr>().getValue().convertToDouble());
 }
 
 TEST_F(FIRBuilderTest, createBool) {
@@ -403,7 +402,7 @@ TEST_F(FIRBuilderTest, getExtents) {
   auto loc = builder.getUnknownLoc();
   llvm::StringRef strValue("length");
   auto strLit = fir::factory::createStringLiteral(builder, loc, strValue);
-  auto ext = fir::factory::getExtents(builder, loc, strLit);
+  auto ext = fir::factory::getExtents(loc, builder, strLit);
   EXPECT_EQ(0u, ext.size());
   auto c10 = builder.createIntegerConstant(loc, builder.getI64Type(), 10);
   auto c100 = builder.createIntegerConstant(loc, builder.getI64Type(), 100);
@@ -413,6 +412,6 @@ TEST_F(FIRBuilderTest, getExtents) {
   mlir::Value array = builder.create<fir::UndefOp>(loc, arrayTy);
   fir::ArrayBoxValue aab(array, extents, {});
   fir::ExtendedValue ex(aab);
-  auto readExtents = fir::factory::getExtents(builder, loc, ex);
+  auto readExtents = fir::factory::getExtents(loc, builder, ex);
   EXPECT_EQ(2u, readExtents.size());
 }

@@ -218,9 +218,9 @@ def SectionsOp : OpenMP_Op<"sections", [AttrSizedOperandSegments]> {
 
 def WsLoopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
                          AllTypesMatch<["lowerBound", "upperBound", "step"]>]> {
-  let summary = "workshare loop construct";
+  let summary = "worksharing-loop construct";
   let description = [{
-    The workshare loop construct specifies that the iterations of the loop(s)
+    The worksharing-loop construct specifies that the iterations of the loop(s)
     will be executed in parallel by threads in the current context. These
     iterations are spread across threads that already exist in the enclosing
     parallel region. The lower and upper bounds specify a half-open range: the
@@ -271,7 +271,8 @@ def WsLoopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
     implicit barrier at the end of the loop.
 
     The optional `ordered_val` attribute specifies how many loops are associated
-    with the do loop construct.
+    with the worksharing-loop construct. The value of zero refers to the ordered
+    clause specified without parameter.
 
     The optional `order` attribute specifies which order the iterations of the
     associate loops are executed in. Currently the only option for this
@@ -281,9 +282,6 @@ def WsLoopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
   let arguments = (ins Variadic<IntLikeType>:$lowerBound,
              Variadic<IntLikeType>:$upperBound,
              Variadic<IntLikeType>:$step,
-             Variadic<AnyType>:$private_vars,
-             Variadic<AnyType>:$firstprivate_vars,
-             Variadic<AnyType>:$lastprivate_vars,
              Variadic<AnyType>:$linear_vars,
              Variadic<AnyType>:$linear_step_vars,
              Variadic<OpenMP_PointerLikeType>:$reduction_vars,
@@ -298,22 +296,9 @@ def WsLoopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
              OptionalAttr<OrderKind>:$order_val,
              UnitAttr:$inclusive);
 
-  let skipDefaultBuilders = 1;
-
   let builders = [
     OpBuilder<(ins "ValueRange":$lowerBound, "ValueRange":$upperBound,
                "ValueRange":$step,
-               CArg<"ArrayRef<NamedAttribute>", "{}">:$attributes)>,
-    OpBuilder<(ins "TypeRange":$resultTypes, "ValueRange":$lowerBound,
-               "ValueRange":$upperBound, "ValueRange":$step,
-               "ValueRange":$privateVars, "ValueRange":$firstprivateVars,
-               "ValueRange":$lastprivate_vars, "ValueRange":$linear_vars,
-               "ValueRange":$linear_step_vars, "ValueRange":$reduction_vars,
-               "StringAttr":$schedule_val, "Value":$schedule_chunk_var,
-               "IntegerAttr":$collapse_val, "UnitAttr":$nowait,
-               "IntegerAttr":$ordered_val, "StringAttr":$order_val,
-               "UnitAttr":$inclusive, CArg<"bool", "true">:$buildBody)>,
-    OpBuilder<(ins "TypeRange":$resultTypes, "ValueRange":$operands,
                CArg<"ArrayRef<NamedAttribute>", "{}">:$attributes)>
   ];
 
@@ -333,14 +318,12 @@ def WsLoopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
 
 def YieldOp : OpenMP_Op<"yield",
     [NoSideEffect, ReturnLike, Terminator,
-     ParentOneOf<["WsLoopOp", "ReductionDeclareOp"]>]> {
+     ParentOneOf<["WsLoopOp", "ReductionDeclareOp", "AtomicUpdateOp"]>]> {
   let summary = "loop yield and termination operation";
   let description = [{
     "omp.yield" yields SSA values from the OpenMP dialect op region and
     terminates the region. The semantics of how the values are yielded is
     defined by the parent operation.
-    If "omp.yield" has any operands, the operands must match the parent
-    operation's results.
   }];
 
   let arguments = (ins Variadic<AnyType>:$results);
@@ -575,11 +558,11 @@ def TaskwaitOp : OpenMP_Op<"taskwait"> {
 // value of the clause) here decomposes handling of this construct into a
 // two-step process.
 
-def AtomicReadOp : OpenMP_Op<"atomic.read"> {
-  let arguments = (ins OpenMP_PointerLikeType:$address,
+def AtomicReadOp : OpenMP_Op<"atomic.read", [AllTypesMatch<["x", "v"]>]> {
+  let arguments = (ins OpenMP_PointerLikeType:$x,
+                       OpenMP_PointerLikeType:$v,
                        DefaultValuedAttr<I64Attr, "0">:$hint,
                        OptionalAttr<MemoryOrderKind>:$memory_order);
-  let results = (outs AnyType);
   let parser = [{ return parseAtomicReadOp(parser, result); }];
   let printer = [{ return printAtomicReadOp(p, *this); }];
   let verifier = [{ return verifyAtomicReadOp(*this); }];
@@ -622,16 +605,23 @@ def AtomicBinOpKindAttr : I64EnumAttr<
   let symbolToStringFnName = "AtomicBinOpKindToString";
 }
 
-def AtomicUpdateOp : OpenMP_Op<"atomic.update"> {
+def AtomicUpdateOp : OpenMP_Op<"atomic.update", [SingleBlockImplicitTerminator<"YieldOp">]> {
   let arguments = (ins OpenMP_PointerLikeType:$x,
-                       AnyType:$expr,
-                       UnitAttr:$isXBinopExpr,
-                       AtomicBinOpKindAttr:$binop,
                        DefaultValuedAttr<I64Attr, "0">:$hint,
                        OptionalAttr<MemoryOrderKind>:$memory_order);
+  let regions = (region SizedRegion<1>:$region);
   let parser = [{ return parseAtomicUpdateOp(parser, result); }];
   let printer = [{ return printAtomicUpdateOp(p, *this); }];
   let verifier = [{ return verifyAtomicUpdateOp(*this); }];
+}
+
+def AtomicCaptureOp : OpenMP_Op<"atomic.capture", [SingleBlockImplicitTerminator<"TerminatorOp">]>{
+    let arguments = (ins DefaultValuedAttr<I64Attr, "0">:$hint,
+                         OptionalAttr<MemoryOrderKind>:$memory_order);
+    let regions = (region SizedRegion<1>:$region);
+    let parser = [{ return parseAtomicCaptureOp(parser, result); }];
+    let printer = [{ return printAtomicCaptureOp(p, *this); }];
+    let verifier = [{ return verifyAtomicCaptureOp(*this);  }];
 }
 
 //===----------------------------------------------------------------------===//

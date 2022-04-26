@@ -321,6 +321,24 @@ static mlir::LogicalResult verify(fir::AllocMemOp &op) {
 // ArrayCoorOp
 //===----------------------------------------------------------------------===//
 
+// CHARACTERs and derived types with LEN PARAMETERs are dependent types that
+// require runtime values to fully define the type of an object.
+static bool validTypeParams(mlir::Type dynTy, mlir::ValueRange typeParams) {
+  dynTy = fir::unwrapAllRefAndSeqType(dynTy);
+  // A box value will contain type parameter values itself.
+  if (dynTy.isa<fir::BoxType>())
+    return typeParams.size() == 0;
+  // Derived type must have all type parameters satisfied.
+  if (auto recTy = dynTy.dyn_cast<fir::RecordType>())
+    return typeParams.size() == recTy.getNumLenParams();
+  // Characters with non-constant LEN must have a type parameter value.
+  if (auto charTy = dynTy.dyn_cast<fir::CharacterType>())
+    if (charTy.hasDynamicLen())
+      return typeParams.size() == 1;
+  // Otherwise, any type parameters are invalid.
+  return typeParams.size() == 0;
+}
+
 static mlir::LogicalResult verify(fir::ArrayCoorOp op) {
   auto eleTy = fir::dyn_cast_ptrOrBoxEleTy(op.getMemref().getType());
   auto arrTy = eleTy.dyn_cast<fir::SequenceType>();
@@ -355,7 +373,8 @@ static mlir::LogicalResult verify(fir::ArrayCoorOp op) {
       if (sliceTy.getRank() != arrDim)
         return op.emitOpError("rank of dimension in slice mismatched");
   }
-
+  if (!validTypeParams(op.getMemref().getType(), op.getTypeparams()))
+    return op.emitOpError("invalid type parameters");
   return mlir::success();
 }
 
@@ -396,7 +415,6 @@ static mlir::LogicalResult verify(fir::ArrayLoadOp op) {
   if (!arrTy)
     return op.emitOpError("must be a reference to an array");
   auto arrDim = arrTy.getDimension();
-
   if (auto shapeOp = op.getShape()) {
     auto shapeTy = shapeOp.getType();
     unsigned shapeTyRank = 0;
@@ -413,7 +431,6 @@ static mlir::LogicalResult verify(fir::ArrayLoadOp op) {
     if (arrDim && arrDim != shapeTyRank)
       return op.emitOpError("rank of dimension mismatched");
   }
-
   if (auto sliceOp = op.getSlice()) {
     if (auto sl = mlir::dyn_cast_or_null<fir::SliceOp>(sliceOp.getDefiningOp()))
       if (!sl.substr().empty())
@@ -422,7 +439,8 @@ static mlir::LogicalResult verify(fir::ArrayLoadOp op) {
       if (sliceTy.getRank() != arrDim)
         return op.emitOpError("rank of dimension in slice mismatched");
   }
-
+  if (!validTypeParams(op.getMemref().getType(), op.getTypeparams()))
+    return op.emitOpError("invalid type parameters");
   return mlir::success();
 }
 
@@ -465,6 +483,8 @@ static mlir::LogicalResult verify(fir::ArrayMergeStoreOp op) {
   if (op.getSequence().getType() != eleTy)
     return op.emitOpError(
         "type of sequence does not match memref element type");
+  if (!validTypeParams(op.getMemref().getType(), op.getTypeparams()))
+    return op.emitOpError("invalid type parameters");
   return mlir::success();
 }
 
@@ -491,8 +511,11 @@ static mlir::LogicalResult verify(fir::ArrayFetchOp op) {
   auto ty = validArraySubobject(op);
   if (!ty || ty != ::adjustedElementType(op.getType()))
     return op.emitOpError("return type and/or indices do not type check");
-  if (!llvm::isa_and_nonnull<fir::ArrayLoadOp>(op.getSequence().getDefiningOp()))
+  if (!llvm::isa_and_nonnull<fir::ArrayLoadOp>(
+          op.getSequence().getDefiningOp()))
     return op.emitOpError("argument #0 must be result of fir.array_load");
+  if (!validTypeParams(arrTy, op.getTypeparams()))
+    return op.emitOpError("invalid type parameters");
   return mlir::success();
 }
 
@@ -511,6 +534,8 @@ static mlir::LogicalResult verify(fir::ArrayAccessOp op) {
   mlir::Type ty = validArraySubobject(op);
   if (!ty || fir::ReferenceType::get(ty) != op.getType())
     return op.emitOpError("return type and/or indices do not type check");
+  if (!validTypeParams(arrTy, op.getTypeparams()))
+    return op.emitOpError("invalid type parameters");
   return mlir::success();
 }
 
@@ -529,6 +554,8 @@ static mlir::LogicalResult verify(fir::ArrayUpdateOp op) {
   auto ty = validArraySubobject(op);
   if (!ty || ty != ::adjustedElementType(op.getMerge().getType()))
     return op.emitOpError("merged value and/or indices do not type check");
+  if (!validTypeParams(arrTy, op.getTypeparams()))
+    return op.emitOpError("invalid type parameters");
   return mlir::success();
 }
 
@@ -550,8 +577,10 @@ static mlir::LogicalResult verify(fir::ArrayModifyOp op) {
 
 mlir::OpFoldResult fir::BoxAddrOp::fold(llvm::ArrayRef<mlir::Attribute> opnds) {
   if (auto *v = getVal().getDefiningOp()) {
-    if (auto box = dyn_cast<fir::EmboxOp>(v))
-      return box.getMemref();
+    if (auto box = dyn_cast<fir::EmboxOp>(v)) {
+      if (!box.getSlice()) // Fold only if not sliced
+        return box.getMemref();
+    }
     if (auto box = dyn_cast<fir::EmboxCharOp>(v))
       return box.getMemref();
   }
@@ -601,7 +630,8 @@ static void printCallOp(mlir::OpAsmPrinter &p, fir::CallOp &op) {
   else
     p << op.getOperand(0);
   p << '(' << op->getOperands().drop_front(isDirect ? 0 : 1) << ')';
-  p.printOptionalAttrDict(op->getAttrs(), {fir::CallOp::getCalleeAttrNameStr()});
+  p.printOptionalAttrDict(op->getAttrs(),
+                          {fir::CallOp::getCalleeAttrNameStr()});
   auto resultTypes{op.getResultTypes()};
   llvm::SmallVector<Type> argTypes(
       llvm::drop_begin(op.getOperandTypes(), isDirect ? 0 : 1));
@@ -1266,7 +1296,8 @@ void fir::GlobalOp::build(mlir::OpBuilder &builder, OperationState &result,
 
 mlir::ParseResult fir::GlobalOp::verifyValidLinkage(StringRef linkage) {
   // Supporting only a subset of the LLVM linkage types for now
-  static const char *validNames[] = {"common", "internal", "linkonce", "weak"};
+  static const char *validNames[] = {"common", "internal", "linkonce",
+                                     "linkonce_odr", "weak"};
   return mlir::success(llvm::is_contained(validNames, linkage));
 }
 
@@ -2103,9 +2134,9 @@ static void print(mlir::OpAsmPrinter &p, fir::DoLoopOp op) {
     p << " -> " << op.getResultTypes();
     printBlockTerminators = true;
   }
-  p.printOptionalAttrDictWithKeyword(op->getAttrs(),
-                                     {fir::DoLoopOp::getUnorderedAttrNameStr(),
-                                      fir::DoLoopOp::getFinalValueAttrNameStr()});
+  p.printOptionalAttrDictWithKeyword(
+      op->getAttrs(), {fir::DoLoopOp::getUnorderedAttrNameStr(),
+                       fir::DoLoopOp::getFinalValueAttrNameStr()});
   p.printRegion(op.getRegion(), /*printEntryBlockArgs=*/false,
                 printBlockTerminators);
 }
@@ -2267,6 +2298,18 @@ static unsigned getBoxRank(mlir::Type boxTy) {
   return 0;
 }
 
+/// Test if \p t1 and \p t2 are compatible character types (if they can
+/// represent the same type at runtime).
+static bool areCompatibleCharacterTypes(mlir::Type t1, mlir::Type t2) {
+  auto c1 = t1.dyn_cast<fir::CharacterType>();
+  auto c2 = t2.dyn_cast<fir::CharacterType>();
+  if (!c1 || !c2)
+    return false;
+  if (c1.hasDynamicLen() || c2.hasDynamicLen())
+    return true;
+  return c1.getLen() == c2.getLen();
+}
+
 static mlir::LogicalResult verify(fir::ReboxOp op) {
   auto inputBoxTy = op.getBox().getType();
   if (fir::isa_unknown_size_box(inputBoxTy))
@@ -2320,15 +2363,21 @@ static mlir::LogicalResult verify(fir::ReboxOp op) {
       return op.emitOpError("result type and shape operand ranks must match");
   }
 
-  if (inputEleTy != outEleTy)
+  if (inputEleTy != outEleTy) {
     // TODO: check that outBoxTy is a parent type of inputBoxTy for derived
     // types.
-    // Character input and output types may be different if there is a
-    // substring in the slice, otherwise, they must match.
-    if (!inputEleTy.isa<fir::RecordType>() &&
-        !(op.getSlice() && inputEleTy.isa<fir::CharacterType>()))
+    // Character input and output types with constant length may be different if
+    // there is a substring in the slice, otherwise, they must match. If any of
+    // the types is a character with dynamic length, the other type can be any
+    // character type.
+    const bool typeCanMismatch =
+        inputEleTy.isa<fir::RecordType>() ||
+        (op.getSlice() && inputEleTy.isa<fir::CharacterType>()) ||
+        areCompatibleCharacterTypes(inputEleTy, outEleTy);
+    if (!typeCanMismatch)
       return op.emitOpError(
           "op input and output element types must match for intrinsic types");
+  }
   return mlir::success();
 }
 
@@ -3050,10 +3099,12 @@ static mlir::LogicalResult verify(fir::StoreOp &op) {
 // StringLitOp
 //===----------------------------------------------------------------------===//
 
-bool fir::StringLitOp::isWideValue() {
-  auto eleTy = getType().cast<fir::SequenceType>().getEleTy();
-  return eleTy.cast<fir::CharacterType>().getFKind() != 1;
+inline fir::CharacterType::KindTy stringLitOpGetKind(fir::StringLitOp op) {
+  auto eleTy = op.getType().cast<fir::SequenceType>().getEleTy();
+  return eleTy.cast<fir::CharacterType>().getFKind();
 }
+
+bool fir::StringLitOp::isWideValue() { return stringLitOpGetKind(*this) != 1; }
 
 static mlir::NamedAttribute
 mkNamedIntegerAttr(mlir::OpBuilder &builder, llvm::StringRef name, int64_t v) {
@@ -3129,6 +3180,9 @@ static mlir::ParseResult parseStringLitOp(mlir::OpAsmParser &parser,
   if (auto v = val.dyn_cast<mlir::StringAttr>())
     result.attributes.push_back(
         builder.getNamedAttr(fir::StringLitOp::value(), v));
+  else if (auto v = val.dyn_cast<mlir::DenseElementsAttr>())
+    result.attributes.push_back(
+        builder.getNamedAttr(fir::StringLitOp::xlist(), v));
   else if (auto v = val.dyn_cast<mlir::ArrayAttr>())
     result.attributes.push_back(
         builder.getNamedAttr(fir::StringLitOp::xlist(), v));
@@ -3162,10 +3216,15 @@ static mlir::LogicalResult verify(fir::StringLitOp &op) {
   if (op.getSize().cast<mlir::IntegerAttr>().getValue().isNegative())
     return op.emitOpError("size must be non-negative");
   if (auto xl = op.getOperation()->getAttr(fir::StringLitOp::xlist())) {
-    auto xList = xl.cast<mlir::ArrayAttr>();
-    for (auto a : xList)
-      if (!a.isa<mlir::IntegerAttr>())
-        return op.emitOpError("values in list must be integers");
+    if (auto xList = xl.dyn_cast<mlir::ArrayAttr>()) {
+      for (auto a : xList)
+        if (!a.isa<mlir::IntegerAttr>())
+          return op.emitOpError("values in initializer must be integers");
+    } else if (xl.isa<mlir::DenseElementsAttr>()) {
+      // do nothing
+    } else {
+      return op.emitOpError("has unexpected attribute");
+    }
   }
   return mlir::success();
 }

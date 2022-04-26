@@ -1601,9 +1601,24 @@ getKmpcForDynamicNextForType(Type *Ty, Module &M, OpenMPIRBuilder &OMPBuilder) {
   llvm_unreachable("unknown OpenMP loop iterator bitwidth");
 }
 
+/// Returns an LLVM function to call for finalizing the dynamic loop using
+/// depending on `type`. Only i32 and i64 are supported by the runtime. Always
+/// interpret integers as unsigned similarly to CanonicalLoopInfo.
+static FunctionCallee
+getKmpcForDynamicFiniForType(Type *Ty, Module &M, OpenMPIRBuilder &OMPBuilder) {
+  unsigned Bitwidth = Ty->getIntegerBitWidth();
+  if (Bitwidth == 32)
+    return OMPBuilder.getOrCreateRuntimeFunction(
+        M, omp::RuntimeFunction::OMPRTL___kmpc_dispatch_fini_4u);
+  if (Bitwidth == 64)
+    return OMPBuilder.getOrCreateRuntimeFunction(
+        M, omp::RuntimeFunction::OMPRTL___kmpc_dispatch_fini_8u);
+  llvm_unreachable("unknown OpenMP loop iterator bitwidth");
+}
+
 OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::applyDynamicWorkshareLoop(
     DebugLoc DL, CanonicalLoopInfo *CLI, InsertPointTy AllocaIP,
-    OMPScheduleType SchedType, bool NeedsBarrier, Value *Chunk) {
+    OMPScheduleType SchedType, bool NeedsBarrier, Value *Chunk, bool Ordered) {
   assert(CLI->isValid() && "Requires a valid canonical loop");
 
   // Set up the source location value for OpenMP runtime.
@@ -1641,6 +1656,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::applyDynamicWorkshareLoop(
   BasicBlock *Header = CLI->getHeader();
   BasicBlock *Exit = CLI->getExit();
   BasicBlock *Cond = CLI->getCond();
+  BasicBlock *Latch = CLI->getLatch();
   InsertPointTy AfterIP = CLI->getAfterIP();
 
   // The CLI will be "broken" in the code below, as the loop is no longer
@@ -1699,6 +1715,13 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::applyDynamicWorkshareLoop(
   auto *BI = cast<BranchInst>(Branch);
   assert(BI->getSuccessor(1) == Exit);
   BI->setSuccessor(1, OuterCond);
+
+  // Call the "fini" function if "ordered" is present in wsloop directive.
+  if (Ordered) {
+    Builder.SetInsertPoint(&Latch->back());
+    FunctionCallee DynamicFini = getKmpcForDynamicFiniForType(IVTy, M, *this);
+    Builder.CreateCall(DynamicFini, {SrcLoc, ThreadNum});
+  }
 
   // Add the barrier if requested.
   if (NeedsBarrier) {
@@ -2463,6 +2486,10 @@ OpenMPIRBuilder::createOrderedDepend(const LocationDescription &Loc,
                                      InsertPointTy AllocaIP, unsigned NumLoops,
                                      ArrayRef<llvm::Value *> StoreValues,
                                      const Twine &Name, bool IsDependSource) {
+  for (size_t I = 0; I < StoreValues.size(); I++)
+    assert(StoreValues[I]->getType()->isIntegerTy(64) &&
+           "OpenMP runtime requires depend vec with i64 type");
+
   if (!updateToLocation(Loc))
     return Loc.IP;
 
@@ -2477,7 +2504,8 @@ OpenMPIRBuilder::createOrderedDepend(const LocationDescription &Loc,
   for (unsigned I = 0; I < NumLoops; ++I) {
     Value *DependAddrGEPIter = Builder.CreateInBoundsGEP(
         ArrI64Ty, ArgsBase, {Builder.getInt64(0), Builder.getInt64(I)});
-    Builder.CreateStore(StoreValues[I], DependAddrGEPIter);
+    StoreInst *STInst = Builder.CreateStore(StoreValues[I], DependAddrGEPIter);
+    STInst->setAlignment(Align(8));
   }
 
   Value *DependBaseAddrGEP = Builder.CreateInBoundsGEP(

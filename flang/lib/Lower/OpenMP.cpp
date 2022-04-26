@@ -49,7 +49,9 @@ static void createPrivateVarSyms(Fortran::lower::AbstractConverter &converter,
         ompObject.u);
 
     // Privatization for symbols which are pre-determined (like loop index
-    // variables) happen separately, for everything else privatize here
+    // variables) happen separately, for everything else privatize here.
+    if (sym->test(Fortran::semantics::Symbol::Flag::OmpPreDetermined))
+      continue;
     if constexpr (std::is_same_v<T, Fortran::parser::OmpClause::Firstprivate>) {
       converter.copyHostAssociateVar(*sym);
     } else {
@@ -107,7 +109,39 @@ static void genObjectList(const Fortran::parser::OmpObjectList &objectList,
                ompObject.u);
   }
 }
+static void handleAllocateClause(
+    Fortran::lower::AbstractConverter &converter,
+    const Fortran::parser::OmpAllocateClause &ompAllocateClause,
+    SmallVector<Value> &allocatorOperands,
+    SmallVector<Value> &allocateOperands) {
+  auto &firOpBuilder = converter.getFirOpBuilder();
+  auto currentLocation = converter.getCurrentLocation();
+  Fortran::lower::StatementContext stmtCtx;
 
+  mlir::Value allocatorOperand;
+  const Fortran::parser::OmpObjectList &ompObjectList =
+      std::get<Fortran::parser::OmpObjectList>(ompAllocateClause.t);
+  const auto &allocatorValue =
+      std::get<std::optional<Fortran::parser::OmpAllocateClause::Allocator>>(
+          ompAllocateClause.t);
+  // Check if allocate clause has allocator specified. If so, add it
+  // to list of allocators, otherwise, add default allocator to
+  // list of allocators.
+
+  if (allocatorValue) {
+    allocatorOperand = fir::getBase(converter.genExprValue(
+        *Fortran::semantics::GetExpr(allocatorValue->v), stmtCtx));
+    allocatorOperands.insert(allocatorOperands.end(), ompObjectList.v.size(),
+                             allocatorOperand);
+  } else {
+    allocatorOperand = firOpBuilder.createIntegerConstant(
+        currentLocation, firOpBuilder.getI32Type(), 1);
+    allocatorOperands.insert(allocatorOperands.end(), ompObjectList.v.size(),
+                             allocatorOperand);
+  }
+
+  genObjectList(ompObjectList, converter, allocateOperands);
+}
 /// Create empty blocks for the current region.
 /// These blocks replace blocks parented to an enclosing region.
 void createEmptyRegionBlocks(
@@ -306,9 +340,9 @@ static void createParallelOp(Fortran::lower::AbstractConverter &converter,
   Fortran::lower::StatementContext stmtCtx;
   llvm::ArrayRef<mlir::Type> argTy;
   mlir::Value ifClauseOperand, numThreadsClauseOperand;
-  llvm::SmallVector<Value, 4> privateClauseOperands, firstprivateClauseOperands,
-      sharedClauseOperands, copyinClauseOperands, allocatorOperands,
-      allocateOperands;
+  SmallVector<Value, 4> privateClauseOperands, firstprivateClauseOperands,
+      sharedClauseOperands, copyinClauseOperands;
+  SmallVector<Value> allocatorOperands, allocateOperands;
   Attribute defaultClauseOperand, procBindClauseOperand;
   const auto &opClauseList =
       std::get<Fortran::parser::OmpClauseList>(directive.t);
@@ -334,29 +368,8 @@ static void createParallelOp(Fortran::lower::AbstractConverter &converter,
     } else if (const auto &allocateClause =
                    std::get_if<Fortran::parser::OmpClause::Allocate>(
                        &clause.u)) {
-      mlir::Value allocatorOperand;
-      const Fortran::parser::OmpAllocateClause &ompAllocateClause =
-          allocateClause->v;
-      const Fortran::parser::OmpObjectList &ompObjectList =
-          std::get<Fortran::parser::OmpObjectList>(ompAllocateClause.t);
-      // Check if allocate clause has allocator specified. If so, add it
-      // to list of allocators, otherwise, add default allocator to
-      // list of allocators.
-      const auto &allocatorValue = std::get<
-          std::optional<Fortran::parser::OmpAllocateClause::Allocator>>(
-          ompAllocateClause.t);
-      if (allocatorValue) {
-        allocatorOperand = fir::getBase(converter.genExprValue(
-            *Fortran::semantics::GetExpr(allocatorValue->v), stmtCtx));
-        allocatorOperands.insert(allocatorOperands.end(),
-                                 ompObjectList.v.size(), allocatorOperand);
-      } else {
-        allocatorOperand = firOpBuilder.createIntegerConstant(
-            currentLocation, firOpBuilder.getI32Type(), 1);
-        allocatorOperands.insert(allocatorOperands.end(),
-                                 ompObjectList.v.size(), allocatorOperand);
-      }
-      genObjectList(ompObjectList, converter, allocateOperands);
+      handleAllocateClause(converter, allocateClause->v, allocatorOperands,
+                           allocateOperands);
     }
   }
   // Create and insert the operation.
@@ -531,9 +544,8 @@ static void genOMP(Fortran::lower::AbstractConverter &converter,
 
   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
   mlir::Location currentLocation = converter.getCurrentLocation();
-  llvm::SmallVector<Value, 4> lowerBound, upperBound, step,
-      privateClauseOperands, firstPrivateClauseOperands,
-      lastPrivateClauseOperands, linearVars, linearStepVars, reductionVars;
+  llvm::SmallVector<mlir::Value> lowerBound, upperBound, step, linearVars,
+      linearStepVars, reductionVars;
   mlir::Value scheduleChunkClauseOperand;
   mlir::Attribute scheduleClauseOperand, collapseClauseOperand,
       noWaitClauseOperand, orderedClauseOperand, orderClauseOperand;
@@ -546,14 +558,6 @@ static void genOMP(Fortran::lower::AbstractConverter &converter,
     createParallelOp<Fortran::parser::OmpBeginLoopDirective, true>(
         converter, eval,
         std::get<Fortran::parser::OmpBeginLoopDirective>(loopConstruct.t));
-  }
-  for (const Fortran::parser::OmpClause &clause : wsLoopOpClauseList.v) {
-    if (const auto &lastPrivateClause =
-            std::get_if<Fortran::parser::OmpClause::Lastprivate>(&clause.u)) {
-      const Fortran::parser::OmpObjectList &ompObjectList =
-          lastPrivateClause->v;
-      genObjectList(ompObjectList, converter, lastPrivateClauseOperands);
-    }
   }
 
   for (const Fortran::parser::OmpClause &clause : wsLoopOpClauseList.v) {
@@ -628,18 +632,17 @@ static void genOMP(Fortran::lower::AbstractConverter &converter,
   // FIXME: Add support for following clauses:
   // 1. linear
   // 2. order
-  TypeRange resultType;
   auto wsLoopOp = firOpBuilder.create<mlir::omp::WsLoopOp>(
-      currentLocation, resultType, lowerBound, upperBound, step,
-      privateClauseOperands, firstPrivateClauseOperands,
-      lastPrivateClauseOperands, linearVars, linearStepVars, reductionVars,
+      currentLocation, lowerBound, upperBound, step, linearVars, linearStepVars,
+      reductionVars, /*reductions=*/nullptr,
       scheduleClauseOperand.dyn_cast_or_null<StringAttr>(),
-      scheduleChunkClauseOperand,
+      scheduleChunkClauseOperand, /*schedule_modifiers=*/nullptr,
+      /*simd_modifier=*/nullptr,
       collapseClauseOperand.dyn_cast_or_null<IntegerAttr>(),
       noWaitClauseOperand.dyn_cast_or_null<UnitAttr>(),
       orderedClauseOperand.dyn_cast_or_null<IntegerAttr>(),
       orderClauseOperand.dyn_cast_or_null<StringAttr>(),
-      firOpBuilder.getUnitAttr() /* Inclusive stop */, false /* buildBody */);
+      /*inclusive=*/firOpBuilder.getUnitAttr());
 
   // Handle attribute based clauses.
   for (const Fortran::parser::OmpClause &clause : wsLoopOpClauseList.v) {
@@ -756,6 +759,65 @@ genOMP(Fortran::lower::AbstractConverter &converter,
   createBodyOfOp<omp::CriticalOp>(criticalOp, converter, currentLocation, eval);
 }
 
+void Fortran::lower::genOpenMPSectionsBlock(
+    Fortran::lower::AbstractConverter &converter,
+    Fortran::lower::pft::Evaluation &eval) {
+  auto &firOpBuilder = converter.getFirOpBuilder();
+  auto currentLocation = converter.getCurrentLocation();
+  mlir::omp::SectionOp sectionOp =
+      firOpBuilder.create<mlir::omp::SectionOp>(currentLocation);
+  createBodyOfOp<omp::SectionOp>(sectionOp, converter, currentLocation, eval);
+}
+
+ // TODO: Add support for reduction and lastprivate
+ static void
+ genOMP(Fortran::lower::AbstractConverter &converter,
+        Fortran::lower::pft::Evaluation &eval,
+        const Fortran::parser::OpenMPSectionsConstruct &sectionsConstruct) {
+     auto &firOpBuilder = converter.getFirOpBuilder();
+     auto currentLocation = converter.getCurrentLocation();
+     SmallVector<Value> privateClauseOperands, firstPrivateClauseOperands,
+         lastPrivateClauseOperands, reductionVars, allocateOperands,
+         allocatorOperands;
+     mlir::UnitAttr noWaitClauseOperand;
+     const auto &sectionsClauseList = std::get<Fortran::parser::OmpClauseList>(
+         std::get<Fortran::parser::OmpBeginSectionsDirective>(
+             sectionsConstruct.t)
+             .t);
+     for (const auto &clause : sectionsClauseList.v) {
+       if (std::get_if<Fortran::parser::OmpClause::Lastprivate>(&clause.u)) {
+         TODO(currentLocation, "OMPC_LastPrivate");
+       }
+       if (std::get_if<Fortran::parser::OmpClause::Reduction>(&clause.u)) {
+         TODO(currentLocation, "OMPC_Reduction");
+       }
+       if (const auto &allocateClause =
+               std::get_if<Fortran::parser::OmpClause::Allocate>(&clause.u)) {
+         handleAllocateClause(converter, allocateClause->v, allocatorOperands,
+                              allocateOperands);
+       }
+     }
+     const auto &endSectionsClauseList =
+         std::get<Fortran::parser::OmpEndSectionsDirective>(
+             sectionsConstruct.t);
+     const auto &clauseList =
+         std::get<Fortran::parser::OmpClauseList>(endSectionsClauseList.t);
+     for (const auto &clause : clauseList.v) {
+       if (std::get_if<Fortran::parser::OmpClause::Nowait>(&clause.u)) {
+         noWaitClauseOperand = firOpBuilder.getUnitAttr();
+       }
+     }
+
+     mlir::omp::SectionsOp sectionsOp =
+         firOpBuilder.create<mlir::omp::SectionsOp>(
+             currentLocation, privateClauseOperands, firstPrivateClauseOperands,
+             lastPrivateClauseOperands, reductionVars, nullptr,
+             allocateOperands, allocatorOperands, noWaitClauseOperand);
+
+     createBodyOfOp<omp::SectionsOp>(sectionsOp, converter, currentLocation,
+                                     eval, &sectionsClauseList);
+ }
+
 void Fortran::lower::genOpenMPConstruct(
     Fortran::lower::AbstractConverter &converter,
     Fortran::lower::pft::Evaluation &eval,
@@ -769,7 +831,7 @@ void Fortran::lower::genOpenMPConstruct(
           },
           [&](const Fortran::parser::OpenMPSectionsConstruct
                   &sectionsConstruct) {
-            TODO(converter.getCurrentLocation(), "OpenMPSectionsConstruct");
+            genOMP(converter, eval, sectionsConstruct);
           },
           [&](const Fortran::parser::OpenMPLoopConstruct &loopConstruct) {
             genOMP(converter, eval, loopConstruct);

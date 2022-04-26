@@ -108,19 +108,28 @@ fir::ExtendedValue Fortran::lower::getAbsentIntrinsicArgument() {
   return fir::UnboxedValue{};
 }
 
-/// Test if an ExtendedValue is absent.
-static bool isAbsent(const fir::ExtendedValue &exv) {
+/// Test if an ExtendedValue is absent. This is used to test if an intrinsic
+/// argument are absent at compile time.
+static bool isStaticallyAbsent(const fir::ExtendedValue &exv) {
   return !fir::getBase(exv);
 }
-static bool isAbsent(llvm::ArrayRef<fir::ExtendedValue> args, size_t argIndex) {
-  return args.size() <= argIndex || isAbsent(args[argIndex]);
+static bool isStaticallyAbsent(llvm::ArrayRef<fir::ExtendedValue> args,
+                               size_t argIndex) {
+  return args.size() <= argIndex || isStaticallyAbsent(args[argIndex]);
 }
-static bool isAbsent(llvm::ArrayRef<mlir::Value> args, size_t argIndex) {
+static bool isStaticallyAbsent(llvm::ArrayRef<mlir::Value> args,
+                               size_t argIndex) {
   return args.size() <= argIndex || !args[argIndex];
 }
 
-/// Test if an ExtendedValue is present.
-static bool isPresent(const fir::ExtendedValue &exv) { return !isAbsent(exv); }
+/// Test if an ExtendedValue is present. This is used to test if an intrinsic
+/// argument is present at compile time. This does not imply that the related
+/// value may not be an absent dummy optional, disassociated pointer, or a
+/// deallocated allocatable. See `handleDynamicOptional` to deal with these
+/// cases when it makes sense.
+static bool isStaticallyPresent(const fir::ExtendedValue &exv) {
+  return !isStaticallyAbsent(exv);
+}
 
 /// Process calls to Maxval, Minval, Product, Sum intrinsic functions that
 /// take a DIM argument.
@@ -139,7 +148,7 @@ genFuncDim(FD funcDim, mlir::Type resultType, fir::FirOpBuilder &builder,
       fir::factory::getMutableIRBox(builder, loc, resultMutableBox);
 
   mlir::Value dim =
-      isAbsent(dimArg)
+      isStaticallyAbsent(dimArg)
           ? builder.createIntegerConstant(loc, builder.getIndexType(), 0)
           : fir::getBase(dimArg);
   funcDim(builder, loc, resultIrBox, array, dim, mask);
@@ -187,12 +196,12 @@ genProdOrSum(FN func, FD funcDim, mlir::Type resultType,
   assert(rank >= 1);
 
   // Handle optional mask argument
-  auto mask = isAbsent(args[2])
+  auto mask = isStaticallyAbsent(args[2])
                   ? builder.create<fir::AbsentOp>(
                         loc, fir::BoxType::get(builder.getI1Type()))
                   : builder.createBox(loc, args[2]);
 
-  bool absentDim = isAbsent(args[1]);
+  bool absentDim = isStaticallyAbsent(args[1]);
 
   // We call the type specific versions because the result is scalar
   // in the case below.
@@ -260,12 +269,12 @@ genExtremumVal(FN func, FD funcDim, FC funcChar, mlir::Type resultType,
   bool hasCharacterResult = arryTmp.isCharacter();
 
   // Handle optional mask argument
-  auto mask = isAbsent(args[2])
+  auto mask = isStaticallyAbsent(args[2])
                   ? builder.create<fir::AbsentOp>(
                         loc, fir::BoxType::get(builder.getI1Type()))
                   : builder.createBox(loc, args[2]);
 
-  bool absentDim = isAbsent(args[1]);
+  bool absentDim = isStaticallyAbsent(args[1]);
 
   // For Maxval/MinVal, we call the type specific versions of
   // Maxval/Minval because the result is scalar in the case below.
@@ -319,22 +328,23 @@ static fir::ExtendedValue genExtremumloc(
   assert(rank >= 1);
 
   // Handle optional mask argument
-  auto mask = isAbsent(args[2])
+  auto mask = isStaticallyAbsent(args[2])
                   ? builder.create<fir::AbsentOp>(
                         loc, fir::BoxType::get(builder.getI1Type()))
                   : builder.createBox(loc, args[2]);
 
   // Handle optional kind argument
-  auto kind = isAbsent(args[3]) ? builder.createIntegerConstant(
-                                      loc, builder.getIndexType(),
-                                      builder.getKindMap().defaultIntegerKind())
-                                : fir::getBase(args[3]);
+  auto kind = isStaticallyAbsent(args[3])
+                  ? builder.createIntegerConstant(
+                        loc, builder.getIndexType(),
+                        builder.getKindMap().defaultIntegerKind())
+                  : fir::getBase(args[3]);
 
   // Handle optional back argument
-  auto back = isAbsent(args[4]) ? builder.createBool(loc, false)
-                                : fir::getBase(args[4]);
+  auto back = isStaticallyAbsent(args[4]) ? builder.createBool(loc, false)
+                                          : fir::getBase(args[4]);
 
-  bool absentDim = isAbsent(args[1]);
+  bool absentDim = isStaticallyAbsent(args[1]);
 
   if (!absentDim && rank == 1) {
     // If dim argument is present and the array is rank 1, then the result is
@@ -720,7 +730,7 @@ static constexpr IntrinsicHandler handlers[]{
      /*isElemental=*/false},
     {"exit",
      &I::genExit,
-     {{{"status", asValue}}},
+     {{{"status", asValue, handleDynamicOptional}}},
      /*isElemental=*/false},
     {"exponent", &I::genExponent},
     {"floor", &I::genFloor},
@@ -728,19 +738,19 @@ static constexpr IntrinsicHandler handlers[]{
     {"get_command_argument",
      &I::genGetCommandArgument,
      {{{"number", asValue},
-       {"value", asAddr},
+       {"value", asBox, handleDynamicOptional},
        {"length", asAddr},
        {"status", asAddr},
-       {"errmsg", asAddr}}},
+       {"errmsg", asBox, handleDynamicOptional}}},
      /*isElemental=*/false},
     {"get_environment_variable",
      &I::genGetEnvironmentVariable,
-     {{{"name", asValue},
-       {"value", asAddr},
+     {{{"name", asBox},
+       {"value", asBox, handleDynamicOptional},
        {"length", asAddr},
        {"status", asAddr},
-       {"trim_name", asValue},
-       {"errmsg", asAddr}}},
+       {"trim_name", asAddr},
+       {"errmsg", asBox, handleDynamicOptional}}},
      /*isElemental=*/false},
     {"iachar", &I::genIchar},
     {"iand", &I::genIand},
@@ -1882,7 +1892,7 @@ IntrinsicLibrary::genAll(mlir::Type resultType,
   assert(rank >= 1);
 
   // Handle optional dim argument
-  bool absentDim = isAbsent(args[1]);
+  bool absentDim = isStaticallyAbsent(args[1]);
   mlir::Value dim =
       absentDim ? builder.createIntegerConstant(loc, builder.getIndexType(), 1)
                 : fir::getBase(args[1]);
@@ -1952,7 +1962,7 @@ IntrinsicLibrary::genAny(mlir::Type resultType,
   assert(rank >= 1);
 
   // Handle optional dim argument
-  bool absentDim = isAbsent(args[1]);
+  bool absentDim = isStaticallyAbsent(args[1]);
   mlir::Value dim =
       absentDim ? builder.createIntegerConstant(loc, builder.getIndexType(), 1)
                 : fir::getBase(args[1]);
@@ -1995,7 +2005,7 @@ IntrinsicLibrary::genAssociated(mlir::Type resultType,
                       fir::emitFatalError(loc, "pointer not a MutableBoxValue");
                     });
   const fir::ExtendedValue &target = args[1];
-  if (isAbsent(target))
+  if (isStaticallyAbsent(target))
     return fir::factory::genIsAllocatedOrAssociatedTest(builder, loc, *pointer);
 
   mlir::Value targetBox = builder.createBox(loc, target);
@@ -2084,7 +2094,7 @@ mlir::Value IntrinsicLibrary::genCmplx(mlir::Type resultType,
   fir::factory::Complex complexHelper(builder, loc);
   mlir::Type partType = complexHelper.getComplexPartType(resultType);
   mlir::Value real = builder.createConvert(loc, partType, args[0]);
-  mlir::Value imag = isAbsent(args, 1)
+  mlir::Value imag = isStaticallyAbsent(args, 1)
                          ? builder.createRealZeroConstant(loc, partType)
                          : builder.createConvert(loc, partType, args[1]);
   return fir::factory::Complex{builder, loc}.createComplex(resultType, real,
@@ -2130,7 +2140,7 @@ IntrinsicLibrary::genCount(mlir::Type resultType,
   assert(maskRank > 0);
 
   // Handle optional dim argument
-  bool absentDim = isAbsent(args[1]);
+  bool absentDim = isStaticallyAbsent(args[1]);
   mlir::Value dim =
       absentDim ? builder.createIntegerConstant(loc, builder.getIndexType(), 0)
                 : fir::getBase(args[1]);
@@ -2146,7 +2156,7 @@ IntrinsicLibrary::genCount(mlir::Type resultType,
   // Call general CountDim runtime routine.
 
   // Handle optional kind argument
-  bool absentKind = isAbsent(args[2]);
+  bool absentKind = isStaticallyAbsent(args[2]);
   mlir::Value kind = absentKind ? builder.createIntegerConstant(
                                       loc, builder.getIndexType(),
                                       builder.getKindMap().defaultIntegerKind())
@@ -2221,7 +2231,7 @@ IntrinsicLibrary::genCshift(mlir::Type resultType,
 
     // Handle optional DIM argument
     mlir::Value dim =
-        isAbsent(args[2])
+        isStaticallyAbsent(args[2])
             ? builder.createIntegerConstant(loc, builder.getIndexType(), 1)
             : fir::getBase(args[2]);
     fir::runtime::genCshift(builder, loc, resultIrBox, array, shift, dim);
@@ -2304,9 +2314,10 @@ IntrinsicLibrary::genEoshift(mlir::Type resultType,
 
   // Handle optional BOUNDARY argument
   mlir::Value boundary =
-      isAbsent(args[2]) ? builder.create<fir::AbsentOp>(
-                              loc, fir::BoxType::get(builder.getNoneType()))
-                        : builder.createBox(loc, args[2]);
+      isStaticallyAbsent(args[2])
+          ? builder.create<fir::AbsentOp>(
+                loc, fir::BoxType::get(builder.getNoneType()))
+          : builder.createBox(loc, args[2]);
 
   if (arrayRank == 1) {
     // Vector case
@@ -2323,7 +2334,7 @@ IntrinsicLibrary::genEoshift(mlir::Type resultType,
 
     // Handle optional DIM argument
     mlir::Value dim =
-        isAbsent(args[3])
+        isStaticallyAbsent(args[3])
             ? builder.createIntegerConstant(loc, builder.getIndexType(), 1)
             : fir::getBase(args[3]);
     fir::runtime::genEoshift(builder, loc, resultIrBox, array, shift, boundary,
@@ -2338,7 +2349,7 @@ void IntrinsicLibrary::genExit(llvm::ArrayRef<fir::ExtendedValue> args) {
   assert(args.size() == 1);
 
   mlir::Value status =
-      isAbsent(args[0])
+      isStaticallyAbsent(args[0])
           ? builder.createIntegerConstant(loc, builder.getDefaultIntegerType(),
                                           EXIT_SUCCESS)
           : fir::getBase(args[0]);
@@ -2385,99 +2396,121 @@ mlir::Value IntrinsicLibrary::genFraction(mlir::Type resultType,
 void IntrinsicLibrary::genGetCommandArgument(
     llvm::ArrayRef<fir::ExtendedValue> args) {
   assert(args.size() == 5);
-
-  auto processCharBox = [&](llvm::Optional<fir::CharBoxValue> arg,
-                            mlir::Value &value) -> void {
-    if (arg.hasValue()) {
-      value = builder.createBox(loc, *arg);
-    } else {
-      value = builder
-                  .create<fir::AbsentOp>(
-                      loc, fir::BoxType::get(builder.getNoneType()))
-                  .getResult();
-    }
-  };
-
-  // Handle NUMBER argument
   mlir::Value number = fir::getBase(args[0]);
+  const fir::ExtendedValue &value = args[1];
+  const fir::ExtendedValue &length = args[2];
+  const fir::ExtendedValue &status = args[3];
+  const fir::ExtendedValue &errmsg = args[4];
+
   if (!number)
     fir::emitFatalError(loc, "expected NUMBER parameter");
 
-  // Handle optional VALUE argument
-  mlir::Value value;
-  llvm::Optional<fir::CharBoxValue> valBox;
-  if (const fir::CharBoxValue *charBox = args[1].getCharBox())
-    valBox = *charBox;
-  processCharBox(valBox, value);
-
-  // Handle optional LENGTH argument
-  mlir::Value length = fir::getBase(args[2]);
-
-  // Handle optional STATUS argument
-  mlir::Value status = fir::getBase(args[3]);
-
-  // Handle optional ERRMSG argument
-  mlir::Value errmsg;
-  llvm::Optional<fir::CharBoxValue> errmsgBox;
-  if (const fir::CharBoxValue *charBox = args[4].getCharBox())
-    errmsgBox = *charBox;
-  processCharBox(errmsgBox, errmsg);
-
-  fir::runtime::genGetCommandArgument(builder, loc, number, value, length,
-                                      status, errmsg);
+  if (isStaticallyPresent(value) || isStaticallyPresent(status) ||
+      isStaticallyPresent(errmsg)) {
+    mlir::Type boxNoneTy = fir::BoxType::get(builder.getNoneType());
+    mlir::Value valBox =
+        isStaticallyPresent(value)
+            ? fir::getBase(value)
+            : builder.create<fir::AbsentOp>(loc, boxNoneTy).getResult();
+    mlir::Value errBox =
+        isStaticallyPresent(errmsg)
+            ? fir::getBase(errmsg)
+            : builder.create<fir::AbsentOp>(loc, boxNoneTy).getResult();
+    mlir::Value stat =
+        fir::runtime::genArgumentValue(builder, loc, number, valBox, errBox);
+    if (isStaticallyPresent(status)) {
+      mlir::Value statAddr = fir::getBase(status);
+      mlir::Value statIsPresentAtRuntime =
+          builder.genIsNotNullAddr(loc, statAddr);
+      builder.genIfThen(loc, statIsPresentAtRuntime)
+          .genThen(
+              [&]() { builder.createStoreWithConvert(loc, stat, statAddr); })
+          .end();
+    }
+  }
+  if (isStaticallyPresent(length)) {
+    mlir::Value lenAddr = fir::getBase(length);
+    mlir::Value lenIsPresentAtRuntime = builder.genIsNotNullAddr(loc, lenAddr);
+    builder.genIfThen(loc, lenIsPresentAtRuntime)
+        .genThen([&]() {
+          mlir::Value len =
+              fir::runtime::genArgumentLength(builder, loc, number);
+          builder.createStoreWithConvert(loc, len, lenAddr);
+        })
+        .end();
+  }
 }
 
 // GET_ENVIRONMENT_VARIABLE
 void IntrinsicLibrary::genGetEnvironmentVariable(
     llvm::ArrayRef<fir::ExtendedValue> args) {
   assert(args.size() == 6);
-
-  auto processCharBox = [&](llvm::Optional<fir::CharBoxValue> arg,
-                            mlir::Value &value) -> void {
-    if (arg.hasValue()) {
-      value = builder.createBox(loc, *arg);
-    } else {
-      value = builder
-                  .create<fir::AbsentOp>(
-                      loc, fir::BoxType::get(builder.getNoneType()))
-                  .getResult();
-    }
-  };
-
-  // Handle NAME argument
-  mlir::Value name;
-  if (const fir::CharBoxValue *charBox = args[0].getCharBox()) {
-    llvm::Optional<fir::CharBoxValue> nameBox = *charBox;
-    assert(nameBox.hasValue());
-    name = builder.createBox(loc, *nameBox);
-  }
-
-  // Handle optional VALUE argument
-  mlir::Value value;
-  llvm::Optional<fir::CharBoxValue> valBox;
-  if (const fir::CharBoxValue *charBox = args[1].getCharBox())
-    valBox = *charBox;
-  processCharBox(valBox, value);
-
-  // Handle optional LENGTH argument
-  mlir::Value length = fir::getBase(args[2]);
-
-  // Handle optional STATUS argument
-  mlir::Value status = fir::getBase(args[3]);
+  mlir::Value name = fir::getBase(args[0]);
+  const fir::ExtendedValue &value = args[1];
+  const fir::ExtendedValue &length = args[2];
+  const fir::ExtendedValue &status = args[3];
+  const fir::ExtendedValue &trimName = args[4];
+  const fir::ExtendedValue &errmsg = args[5];
 
   // Handle optional TRIM_NAME argument
-  mlir::Value trim_name =
-      isAbsent(args[4]) ? builder.createBool(loc, true) : fir::getBase(args[4]);
+  mlir::Value trim;
+  if (isStaticallyAbsent(trimName)) {
+    trim = builder.createBool(loc, true);
+  } else {
+    mlir::Type i1Ty = builder.getI1Type();
+    mlir::Value trimNameAddr = fir::getBase(trimName);
+    mlir::Value trimNameIsPresentAtRuntime =
+        builder.genIsNotNullAddr(loc, trimNameAddr);
+    trim = builder
+               .genIfOp(loc, {i1Ty}, trimNameIsPresentAtRuntime,
+                        /*withElseRegion=*/true)
+               .genThen([&]() {
+                 auto trimLoad = builder.create<fir::LoadOp>(loc, trimNameAddr);
+                 mlir::Value cast = builder.createConvert(loc, i1Ty, trimLoad);
+                 builder.create<fir::ResultOp>(loc, cast);
+               })
+               .genElse([&]() {
+                 mlir::Value trueVal = builder.createBool(loc, true);
+                 builder.create<fir::ResultOp>(loc, trueVal);
+               })
+               .getResults()[0];
+  }
 
-  // Handle optional ERRMSG argument
-  mlir::Value errmsg;
-  llvm::Optional<fir::CharBoxValue> errmsgBox;
-  if (const fir::CharBoxValue *charBox = args[5].getCharBox())
-    errmsgBox = *charBox;
-  processCharBox(errmsgBox, errmsg);
+  if (isStaticallyPresent(value) || isStaticallyPresent(status) ||
+      isStaticallyPresent(errmsg)) {
+    mlir::Type boxNoneTy = fir::BoxType::get(builder.getNoneType());
+    mlir::Value valBox =
+        isStaticallyPresent(value)
+            ? fir::getBase(value)
+            : builder.create<fir::AbsentOp>(loc, boxNoneTy).getResult();
+    mlir::Value errBox =
+        isStaticallyPresent(errmsg)
+            ? fir::getBase(errmsg)
+            : builder.create<fir::AbsentOp>(loc, boxNoneTy).getResult();
+    mlir::Value stat = fir::runtime::genEnvVariableValue(builder, loc, name,
+                                                         valBox, trim, errBox);
+    if (isStaticallyPresent(status)) {
+      mlir::Value statAddr = fir::getBase(status);
+      mlir::Value statIsPresentAtRuntime =
+          builder.genIsNotNullAddr(loc, statAddr);
+      builder.genIfThen(loc, statIsPresentAtRuntime)
+          .genThen(
+              [&]() { builder.createStoreWithConvert(loc, stat, statAddr); })
+          .end();
+    }
+  }
 
-  fir::runtime::genGetEnvironmentVariable(builder, loc, name, value, length,
-                                          status, trim_name, errmsg);
+  if (isStaticallyPresent(length)) {
+    mlir::Value lenAddr = fir::getBase(length);
+    mlir::Value lenIsPresentAtRuntime = builder.genIsNotNullAddr(loc, lenAddr);
+    builder.genIfThen(loc, lenIsPresentAtRuntime)
+        .genThen([&]() {
+          mlir::Value len =
+              fir::runtime::genEnvVariableLength(builder, loc, name, trim);
+          builder.createStoreWithConvert(loc, len, lenAddr);
+        })
+        .end();
+  }
 }
 
 // IAND
@@ -2577,6 +2610,8 @@ IntrinsicLibrary::genIchar(mlir::Type resultType,
   }
   LLVM_DEBUG(llvm::dbgs() << "ichar(" << charVal << ")\n");
   auto code = helper.extractCodeFromSingleton(charVal);
+  if (code.getType() == resultType)
+    return code;
   return builder.create<mlir::arith::ExtUIOp>(loc, resultType, code);
 }
 
@@ -2601,10 +2636,10 @@ IntrinsicLibrary::genIndex(mlir::Type resultType,
   mlir::Value substringBase = fir::getBase(args[1]);
   mlir::Value substringLen = fir::getLen(args[1]);
   mlir::Value back =
-      isAbsent(args, 2)
+      isStaticallyAbsent(args, 2)
           ? builder.createIntegerConstant(loc, builder.getI1Type(), 0)
           : fir::getBase(args[2]);
-  if (isAbsent(args, 3))
+  if (isStaticallyAbsent(args, 3))
     return builder.createConvert(
         loc, resultType,
         fir::runtime::genIndex(builder, loc, kind, stringBase, stringLen,
@@ -2621,11 +2656,11 @@ IntrinsicLibrary::genIndex(mlir::Type resultType,
     builder.create<fir::StoreOp>(loc, castb, temp);
     return builder.createBox(loc, temp);
   };
-  mlir::Value backOpt = isAbsent(args, 2)
+  mlir::Value backOpt = isStaticallyAbsent(args, 2)
                             ? builder.create<fir::AbsentOp>(
                                   loc, fir::BoxType::get(builder.getI1Type()))
                             : makeRefThenEmbox(fir::getBase(args[2]));
-  mlir::Value kindVal = isAbsent(args, 3)
+  mlir::Value kindVal = isStaticallyAbsent(args, 3)
                             ? builder.createIntegerConstant(
                                   loc, builder.getIndexType(),
                                   builder.getKindMap().defaultIntegerKind())
@@ -2965,7 +3000,7 @@ fir::ExtendedValue
 IntrinsicLibrary::genNull(mlir::Type, llvm::ArrayRef<fir::ExtendedValue> args) {
   // NULL() without MOLD must be handled in the contexts where it can appear
   // (see table 16.5 of Fortran 2018 standard).
-  assert(args.size() == 1 && isPresent(args[0]) &&
+  assert(args.size() == 1 && isStaticallyPresent(args[0]) &&
          "MOLD argument required to lower NULL outside of any context");
   const auto *mold = args[0].getBoxOf<fir::MutableBoxValue>();
   assert(mold && "MOLD must be a pointer or allocatable");
@@ -2991,7 +3026,7 @@ IntrinsicLibrary::genPack(mlir::Type resultType,
   mlir::Value mask = builder.createBox(loc, args[1]);
 
   // Handle optional vector argument
-  mlir::Value vector = isAbsent(args, 2)
+  mlir::Value vector = isStaticallyAbsent(args, 2)
                            ? builder.create<fir::AbsentOp>(
                                  loc, fir::BoxType::get(builder.getI1Type()))
                            : builder.createBox(loc, args[2]);
@@ -3045,7 +3080,7 @@ void IntrinsicLibrary::genRandomNumber(
 void IntrinsicLibrary::genRandomSeed(llvm::ArrayRef<fir::ExtendedValue> args) {
   assert(args.size() == 3);
   for (int i = 0; i < 3; ++i)
-    if (isPresent(args[i])) {
+    if (isStaticallyPresent(args[i])) {
       Fortran::lower::genRandomSeed(builder, loc, i, fir::getBase(args[i]));
       return;
     }
@@ -3091,13 +3126,13 @@ IntrinsicLibrary::genReshape(mlir::Type resultType,
          "shape arg must have constant size");
 
   // Handle optional pad argument
-  mlir::Value pad = isAbsent(args[2])
+  mlir::Value pad = isStaticallyAbsent(args[2])
                         ? builder.create<fir::AbsentOp>(
                               loc, fir::BoxType::get(builder.getI1Type()))
                         : builder.createBox(loc, args[2]);
 
   // Handle optional order argument
-  mlir::Value order = isAbsent(args[3])
+  mlir::Value order = isStaticallyAbsent(args[3])
                           ? builder.create<fir::AbsentOp>(
                                 loc, fir::BoxType::get(builder.getI1Type()))
                           : builder.createBox(loc, args[3]);
@@ -3146,7 +3181,7 @@ IntrinsicLibrary::genScan(mlir::Type resultType,
 
   assert(args.size() == 4);
 
-  if (isAbsent(args[3])) {
+  if (isStaticallyAbsent(args[3])) {
     // Kind not specified, so call scan/verify runtime routine that is
     // specialized on the kind of characters in string.
 
@@ -3169,7 +3204,7 @@ IntrinsicLibrary::genScan(mlir::Type resultType,
 
     // Handle optional back argument
     mlir::Value back =
-        isAbsent(args[2])
+        isStaticallyAbsent(args[2])
             ? builder.createIntegerConstant(loc, builder.getI1Type(), 0)
             : fir::getBase(args[2]);
 
@@ -3259,7 +3294,7 @@ IntrinsicLibrary::genSize(mlir::Type resultType,
   // The front-end rewrites SIZE without the DIM argument to
   // an array of SIZE with DIM in most cases, but it may not be
   // possible in some cases like when in SIZE(function_call()).
-  if (isAbsent(args, 1))
+  if (isStaticallyAbsent(args, 1))
     return builder.createConvert(loc, resultType,
                                  fir::runtime::genSize(builder, loc, array));
 
@@ -3269,7 +3304,7 @@ IntrinsicLibrary::genSize(mlir::Type resultType,
     return builder.createConvert(
         loc, resultType, fir::runtime::genSizeDim(builder, loc, array, dim));
 
-  mlir::Value isDynamicallyAbsent = builder.genIsNull(loc, dim);
+  mlir::Value isDynamicallyAbsent = builder.genIsNullAddr(loc, dim);
   return builder
       .genIfOp(loc, {resultType}, isDynamicallyAbsent,
                /*withElseRegion=*/true)
@@ -3288,41 +3323,133 @@ IntrinsicLibrary::genSize(mlir::Type resultType,
       .getResults()[0];
 }
 
+static bool hasDefaultLowerBound(const fir::ExtendedValue &exv) {
+  return exv.match(
+      [](const fir::ArrayBoxValue &arr) { return arr.getLBounds().empty(); },
+      [](const fir::CharArrayBoxValue &arr) {
+        return arr.getLBounds().empty();
+      },
+      [](const fir::BoxValue &arr) { return arr.getLBounds().empty(); },
+      [](const auto &) { return false; });
+}
+
+/// Compute the lower bound in dimension \p dim (zero based) of \p array
+/// taking care of returning one when the related extent is zero.
+static mlir::Value computeLBOUND(fir::FirOpBuilder &builder, mlir::Location loc,
+                                 const fir::ExtendedValue &array, unsigned dim,
+                                 mlir::Value zero, mlir::Value one) {
+  assert(dim < array.rank() && "invalid dimension");
+  if (hasDefaultLowerBound(array))
+    return one;
+  mlir::Value lb = fir::factory::readLowerBound(builder, loc, array, dim, one);
+  if (dim + 1 == array.rank() && array.isAssumedSize())
+    return lb;
+  mlir::Value extent = fir::factory::readExtent(builder, loc, array, dim);
+  zero = builder.createConvert(loc, extent.getType(), zero);
+  auto dimIsEmpty = builder.create<mlir::arith::CmpIOp>(
+      loc, mlir::arith::CmpIPredicate::eq, extent, zero);
+  one = builder.createConvert(loc, lb.getType(), one);
+  return builder.create<mlir::SelectOp>(loc, dimIsEmpty, one, lb);
+}
+
+/// Create a fir.box to be passed to the LBOUND runtime.
+/// This ensure that local lower bounds of assumed shape are propagated and that
+/// a fir.box with equivalent LBOUNDs but an explicit shape is created for
+/// assumed size arrays to avoid undefined behaviors in codegen or the runtime.
+static mlir::Value createBoxForLBOUND(mlir::Location loc,
+                                      fir::FirOpBuilder &builder,
+                                      const fir::ExtendedValue &array) {
+  if (!array.isAssumedSize())
+    return array.match(
+        [&](const fir::BoxValue &boxValue) -> mlir::Value {
+          // This entity is mapped to a fir.box that may not contain the local
+          // lower bound information if it is a dummy. Rebox it with the local
+          // shape information.
+          mlir::Value localShape = builder.createShape(loc, array);
+          mlir::Value oldBox = boxValue.getAddr();
+          return builder.create<fir::ReboxOp>(loc, oldBox.getType(), oldBox,
+                                              localShape,
+                                              /*slice=*/mlir::Value{});
+        },
+        [&](const auto &) -> mlir::Value {
+          // This a pointer/allocatable, or an entity not yet tracked with a
+          // fir.box. For pointer/allocatable, createBox will forward the
+          // descriptor that contains the correct lower bound information. For
+          // other entities, a new fir.box will be made with the local lower
+          // bounds.
+          return builder.createBox(loc, array);
+        });
+  // Assumed sized are not meant to be emboxed. This could cause the undefined
+  // extent cannot safely be understood by the runtime/codegen that will
+  // consider that the dimension is empty and that the related LBOUND value must
+  // be one. Pretend that the related extent is one to get the correct LBOUND
+  // value.
+  llvm::SmallVector<mlir::Value> shape =
+      fir::factory::getExtents(loc, builder, array);
+  assert(!shape.empty() && "assumed size must have at least one dimension");
+  shape.back() = builder.createIntegerConstant(loc, builder.getIndexType(), 1);
+  auto safeToEmbox = array.match(
+      [&](const fir::CharArrayBoxValue &x) -> fir::ExtendedValue {
+        return fir::CharArrayBoxValue{x.getAddr(), x.getLen(), shape,
+                                      x.getLBounds()};
+      },
+      [&](const fir::ArrayBoxValue &x) -> fir::ExtendedValue {
+        return fir::ArrayBoxValue{x.getAddr(), shape, x.getLBounds()};
+      },
+      [&](const auto &) -> fir::ExtendedValue {
+        fir::emitFatalError(loc, "not an assumed size array");
+      });
+  return builder.createBox(loc, safeToEmbox);
+}
+
 // LBOUND
 fir::ExtendedValue
 IntrinsicLibrary::genLbound(mlir::Type resultType,
                             llvm::ArrayRef<fir::ExtendedValue> args) {
-  // Calls to LBOUND that don't have the DIM argument, or for which
-  // the DIM is a compile time constant, are folded to descriptor inquiries by
-  // semantics.  This function covers the situations where a call to the
-  // runtime is required.
-  assert(args.size() == 3);
-  assert(!isAbsent(args[1]));
-  if (const auto *boxValue = args[0].getBoxOf<fir::BoxValue>())
+  assert(args.size() > 0);
+  const fir::ExtendedValue &array = args[0];
+  if (const auto *boxValue = array.getBoxOf<fir::BoxValue>())
     if (boxValue->hasAssumedRank())
       TODO(loc, "LBOUND intrinsic with assumed rank argument");
 
-  const fir::ExtendedValue &array = args[0];
-  mlir::Value box = array.match(
-      [&](const fir::BoxValue &boxValue) -> mlir::Value {
-        // This entity is mapped to a fir.box that may not contain the local
-        // lower bound information if it is a dummy. Rebox it with the local
-        // shape information.
-        mlir::Value localShape = builder.createShape(loc, array);
-        mlir::Value oldBox = boxValue.getAddr();
-        return builder.create<fir::ReboxOp>(
-            loc, oldBox.getType(), oldBox, localShape, /*slice=*/mlir::Value{});
-      },
-      [&](const auto &) -> mlir::Value {
-        // This a pointer/allocatable, or an entity not yet tracked with a
-        // fir.box. For pointer/allocatable, createBox will forward the
-        // descriptor that contains the correct lower bound information. For
-        // other entities, a new fir.box will be made with the local lower
-        // bounds.
-        return builder.createBox(loc, array);
-      });
+  //===----------------------------------------------------------------------===//
+  mlir::Type indexType = builder.getIndexType();
 
+  if (isStaticallyAbsent(args, 1)) {
+    mlir::Type lbType = fir::unwrapSequenceType(resultType);
+    unsigned rank = array.rank();
+    mlir::Type lbArrayType = fir::SequenceType::get(
+        {static_cast<fir::SequenceType::Extent>(array.rank())}, lbType);
+    mlir::Value lbArray = builder.createTemporary(loc, lbArrayType);
+    mlir::Type lbAddrType = builder.getRefType(lbType);
+    mlir::Value one = builder.createIntegerConstant(loc, lbType, 1);
+    mlir::Value zero = builder.createIntegerConstant(loc, indexType, 0);
+    for (unsigned dim = 0; dim < rank; ++dim) {
+      mlir::Value lb = computeLBOUND(builder, loc, array, dim, zero, one);
+      lb = builder.createConvert(loc, lbType, lb);
+      auto index = builder.createIntegerConstant(loc, indexType, dim);
+      auto lbAddr =
+          builder.create<fir::CoordinateOp>(loc, lbAddrType, lbArray, index);
+      builder.create<fir::StoreOp>(loc, lb, lbAddr);
+    }
+    mlir::Value lbArrayExtent =
+        builder.createIntegerConstant(loc, indexType, rank);
+    llvm::SmallVector<mlir::Value> extents{lbArrayExtent};
+    return fir::ArrayBoxValue{lbArray, extents};
+  }
+  // DIM is present.
   mlir::Value dim = fir::getBase(args[1]);
+
+  // If it is a compile time constant, skip the runtime call.
+  if (llvm::Optional<std::int64_t> cstDim =
+          fir::factory::getIntIfConstant(dim)) {
+    mlir::Value one = builder.createIntegerConstant(loc, resultType, 1);
+    mlir::Value zero = builder.createIntegerConstant(loc, indexType, 0);
+    mlir::Value lb = computeLBOUND(builder, loc, array, *cstDim - 1, zero, one);
+    return builder.createConvert(loc, resultType, lb);
+  }
+
+  fir::ExtendedValue box = createBoxForLBOUND(loc, builder, array);
   return builder.createConvert(
       loc, resultType,
       fir::runtime::genLboundDim(builder, loc, fir::getBase(box), dim));
@@ -3343,7 +3470,7 @@ IntrinsicLibrary::genUbound(mlir::Type resultType,
     return builder.create<mlir::arith::AddIOp>(loc, ubound, extent);
   } else {
     // Handle calls to UBOUND without the DIM argument, which return an array
-    mlir::Value kind = isAbsent(args[1])
+    mlir::Value kind = isStaticallyAbsent(args[1])
                            ? builder.createIntegerConstant(
                                  loc, builder.getIndexType(),
                                  builder.getKindMap().defaultIntegerKind())
@@ -3561,7 +3688,7 @@ static mlir::Value createExtremumCompare(mlir::Location loc,
   } else if (fir::isa_integer(type)) {
     result =
         builder.create<mlir::arith::CmpIOp>(loc, integerPredicate, left, right);
-  } else if (fir::isa_char(type)) {
+  } else if (fir::isa_char(type) || fir::isa_char(fir::unwrapRefType(type))) {
     // TODO: ! character min and max is tricky because the result
     // length is the length of the longest argument!
     // So we may need a temp.
@@ -3608,7 +3735,7 @@ IntrinsicLibrary::genVerify(mlir::Type resultType,
 
   assert(args.size() == 4);
 
-  if (isAbsent(args[3])) {
+  if (isStaticallyAbsent(args[3])) {
     // Kind not specified, so call scan/verify runtime routine that is
     // specialized on the kind of characters in string.
 
@@ -3631,7 +3758,7 @@ IntrinsicLibrary::genVerify(mlir::Type resultType,
 
     // Handle optional back argument
     mlir::Value back =
-        isAbsent(args[2])
+        isStaticallyAbsent(args[2])
             ? builder.createIntegerConstant(loc, builder.getI1Type(), 0)
             : fir::getBase(args[2]);
 

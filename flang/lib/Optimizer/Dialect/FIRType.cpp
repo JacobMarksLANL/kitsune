@@ -283,6 +283,17 @@ bool isRecordWithAllocatableMember(mlir::Type ty) {
   return false;
 }
 
+mlir::Type unwrapAllRefAndSeqType(mlir::Type ty) {
+  while (true) {
+    mlir::Type nt = unwrapSequenceType(unwrapRefType(ty));
+    if (auto vecTy = nt.dyn_cast<fir::VectorType>())
+      nt = vecTy.getEleTy();
+    if (nt == ty)
+      return ty;
+    ty = nt;
+  }
+}
+
 } // namespace fir
 
 namespace {
@@ -677,12 +688,6 @@ unsigned fir::RecordType::getFieldIndex(llvm::StringRef ident) {
     if (ident == f.value().first)
       return f.index();
   return std::numeric_limits<unsigned>::max();
-}
-
-std::string fir::RecordType::translateNameToFrontendMangledName() const {
-  auto split = getName().split('T');
-  std::string name = (split.first + "E.dt." + split.second).str();
-  return name;
 }
 
 //===----------------------------------------------------------------------===//

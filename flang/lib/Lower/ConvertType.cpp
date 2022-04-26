@@ -11,6 +11,7 @@
 #include "flang/Evaluate/shape.h"
 #include "flang/Lower/AbstractConverter.h"
 #include "flang/Lower/CallInterface.h"
+#include "flang/Lower/ConvertVariable.h"
 #include "flang/Lower/Mangler.h"
 #include "flang/Lower/PFTBuilder.h"
 #include "flang/Lower/Support/Utils.h"
@@ -163,7 +164,7 @@ struct TypeBuilder {
       int rank = expr.Rank();
       if (rank < 0)
         TODO(converter.getCurrentLocation(),
-             "Assumed rank expression type lowering");
+             "assumed rank expression type lowering");
       for (int dim = 0; dim < rank; ++dim)
         shape.emplace_back(fir::SequenceType::getUnknownExtent());
     }
@@ -227,6 +228,8 @@ struct TypeBuilder {
     // links, the fir type is built based on the ultimate symbol. This relies
     // on the fact volatile and asynchronous are not reflected in fir types.
     const Fortran::semantics::Symbol &ultimate = symbol.GetUltimate();
+    if (Fortran::semantics::IsProcedurePointer(ultimate))
+      TODO(loc, "procedure pointers");
     if (const Fortran::semantics::DeclTypeSpec *type = ultimate.GetType()) {
       if (const Fortran::semantics::IntrinsicTypeSpec *tySpec =
               type->AsIntrinsic()) {
@@ -289,6 +292,10 @@ struct TypeBuilder {
     const Fortran::semantics::Symbol &typeSymbol = tySpec.typeSymbol();
     if (mlir::Type ty = getTypeIfDerivedAlreadyInConstruction(typeSymbol))
       return ty;
+
+    if (Fortran::semantics::IsFinalizable(tySpec))
+      TODO(converter.genLocation(tySpec.name()), "derived type finalization");
+
     auto rec = fir::RecordType::get(context,
                                     Fortran::lower::mangle::mangleName(tySpec));
     // Maintain the stack of types for recursive references.
@@ -324,13 +331,20 @@ struct TypeBuilder {
     rec.finalize(ps, cs);
     popDerivedTypeInConstruction();
 
+    mlir::Location loc = converter.genLocation(typeSymbol.name());
     if (!ps.empty()) {
       // This type is a PDT (parametric derived type). Create the functions to
       // use for allocation, dereferencing, and address arithmetic here.
-      TODO(converter.genLocation(typeSymbol.name()),
-           "parametrized derived types lowering");
+      TODO(loc, "parameterized derived types lowering");
     }
     LLVM_DEBUG(llvm::dbgs() << "derived type: " << rec << '\n');
+
+    // Generate the type descriptor object if any
+    if (const Fortran::semantics::Scope *derivedScope =
+            tySpec.scope() ? tySpec.scope() : tySpec.typeSymbol().scope())
+      if (const Fortran::semantics::Symbol *typeInfoSym =
+              derivedScope->runtimeDerivedTypeDescription())
+        converter.registerRuntimeTypeInfo(loc, *typeInfoSym);
     return rec;
   }
 
